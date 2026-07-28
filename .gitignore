@@ -1,0 +1,7 @@
+.cache/
+model/
+textures/
+viewer_js/
+deobfuscated/
+*.glb
+/target

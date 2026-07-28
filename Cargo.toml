@@ -1,0 +1,20 @@
+[package]
+name = "sketchfab-downloader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rand = "0.8"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde_json = "1.0"
+wasmtime = "23.0"
+
+[[bin]]
+name = "sketchfab-dl"
+path = "src/main.rs"
