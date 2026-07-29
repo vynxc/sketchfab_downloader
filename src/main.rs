@@ -719,7 +719,6 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
         })
         .collect();
     let vertex_color = model.pointer("/options/shading/vertexColor");
-
     Ok(ModelConfig {
         work_dir: Path::new(CACHE_DIR).join(uid),
         base_url,
@@ -740,7 +739,7 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
             .and_then(|value| value.get("colorSpace"))
             .and_then(Value::as_str)
             == Some("srgb"),
-        flip_uvs: !global_unlit,
+        flip_uvs: true,
     })
 }
 
@@ -2017,17 +2016,6 @@ fn contains_gltf_scene_root(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.values().any(contains_gltf_scene_root),
         Value::Array(array) => array.iter().any(contains_gltf_scene_root),
-        _ => false,
-    }
-}
-
-fn contains_texture_attributes(value: &Value) -> bool {
-    if value.get("TextureAttributeList").is_some() {
-        return true;
-    }
-    match value {
-        Value::Object(object) => object.values().any(contains_texture_attributes),
-        Value::Array(array) => array.iter().any(contains_texture_attributes),
         _ => false,
     }
 }
@@ -3704,7 +3692,6 @@ fn convert_to_glb(
     flip_uvs: bool,
 ) -> Result<Vec<u8>> {
     println!("[5/6] Converting to glTF...");
-    let flip_uvs = flip_uvs || contains_texture_attributes(osgjs);
     let mut geometries = collect_geometries(osgjs, poly_bin, wire_bin)?;
     let animated_geometry_count = geometries
         .iter()
@@ -4102,18 +4089,6 @@ mod tests {
                 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
             ]
         );
-    }
-
-    #[test]
-    fn detects_scene_texture_bindings() {
-        assert!(contains_texture_attributes(&json!({
-            "osg.StateSet": {
-                "TextureAttributeList": [[], []]
-            }
-        })));
-        assert!(!contains_texture_attributes(
-            &json!({"osg.Node": {"Children": []}})
-        ));
     }
 
     fn black_material() -> MaterialEntry {
