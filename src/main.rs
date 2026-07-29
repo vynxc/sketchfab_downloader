@@ -42,8 +42,11 @@ struct MaterialEntry {
     emissive_color: [f32; 3],
     emissive_texture: Option<String>,
     occlusion_texture: Option<String>,
+    normal_texture: Option<String>,
     metallic_factor: f32,
     roughness_factor: f32,
+    alpha_mode: &'static str,
+    alpha_cutoff: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -387,15 +390,20 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
                 .or_else(|| enabled_channel(material, "AlbedoPBR"));
             let emissive = enabled_channel(material, "EmitColor");
             let occlusion = enabled_channel(material, "AOPBR");
+            let normal = enabled_channel(material, "NormalMap");
             let metallic = enabled_channel(material, "MetalnessPBR");
             let roughness = enabled_channel(material, "RoughnessPBR");
+            let opacity = enabled_channel(material, "Opacity");
+            let alpha_mask = enabled_channel(material, "AlphaMask");
             let base_color_texture = texture_uid(diffuse);
             let emissive_texture = texture_uid(emissive);
             let occlusion_texture = texture_uid(occlusion);
+            let normal_texture = texture_uid(normal);
             for uid in [
                 base_color_texture.as_ref(),
                 emissive_texture.as_ref(),
                 occlusion_texture.as_ref(),
+                normal_texture.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -411,15 +419,27 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
             for value in &mut emissive_color {
                 *value *= emissive_factor;
             }
+            let alpha_mode = if alpha_mask.is_some() {
+                "MASK"
+            } else if opacity.is_some() {
+                "BLEND"
+            } else {
+                "OPAQUE"
+            };
+            let alpha = opacity
+                .and_then(|v| v.get("factor"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
             materials.insert(
                 name.to_owned(),
                 MaterialEntry {
                     name: name.to_owned(),
-                    base_color: [base_rgb[0], base_rgb[1], base_rgb[2], 1.0],
+                    base_color: [base_rgb[0], base_rgb[1], base_rgb[2], alpha],
                     base_color_texture,
                     emissive_color,
                     emissive_texture,
                     occlusion_texture,
+                    normal_texture,
                     metallic_factor: metallic
                         .and_then(|v| v.get("factor"))
                         .and_then(Value::as_f64)
@@ -428,6 +448,11 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
                         .and_then(|v| v.get("factor"))
                         .and_then(Value::as_f64)
                         .unwrap_or(1.0) as f32,
+                    alpha_mode,
+                    alpha_cutoff: alpha_mask
+                        .and_then(|v| v.get("factor"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.5) as f32,
                 },
             );
         }
@@ -1016,15 +1041,23 @@ fn decode_varint(bytes: &[u8], count: usize, signed: bool) -> Result<Vec<i64>> {
     Ok(out)
 }
 
-fn delta_decode(arr: &mut [u32], start: usize) {
+fn typed_u32(value: i64, bits: u32) -> u32 {
+    if bits == 16 {
+        value as u16 as u32
+    } else {
+        value as u32
+    }
+}
+
+fn delta_decode(arr: &mut [u32], start: usize, bits: u32) {
     if arr.is_empty() || start >= arr.len() {
         return;
     }
-    let mut prev = arr[start] as i64;
+    let mut prev = arr[start];
     for v in arr.iter_mut().skip(start + 1) {
         let x = *v as i64;
-        prev += (x >> 1) ^ -(x & 1);
-        *v = prev as u32;
+        *v = typed_u32(prev as i64 + ((x >> 1) ^ -(x & 1)), bits);
+        prev = *v;
     }
 }
 
@@ -1056,15 +1089,16 @@ fn implicit_decode(enc: &[u32], out_len: usize, start_idx: usize, use_expected: 
     out
 }
 
-fn expected_renumber(arr: &mut [u32]) {
-    let mut n = 0u32;
+fn expected_renumber(arr: &mut [u32], state: &mut i64, bits: u32) {
+    let mut n = *state;
     for a in arr {
-        let o = n.wrapping_sub(*a);
-        *a = o;
+        let o = n - *a as i64;
+        *a = typed_u32(o, bits);
         if n <= o {
             n = o + 1;
         }
     }
+    *state = n;
 }
 
 fn strip_to_tris(indices: &[u32]) -> Vec<u32> {
@@ -1168,6 +1202,11 @@ fn process_geometry(
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
+        })
+        .or_else(|| {
+            geom.pointer("/StateSet/osg.StateSet/Name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         });
     let mut meta = HashMap::new();
     if let Some(values) = geom
@@ -1188,7 +1227,8 @@ fn process_geometry(
     }
 
     let mut strip_indices = None;
-    let mut indices = None;
+    let mut indices = Vec::new();
+    let mut expected_state = 0i64;
     if let Some(prims) = geom.get("PrimitiveSetList").and_then(Value::as_array) {
         for prim in prims {
             let Some((_, draw)) = first_key_value(prim) else {
@@ -1213,17 +1253,23 @@ fn process_geometry(
             } else {
                 poly_bin
             };
+            let mode = draw.get("Mode").and_then(Value::as_str);
+            let is_strip = mode == Some("TRIANGLE_STRIP");
+            if !is_strip && mode != Some("TRIANGLES") {
+                continue;
+            }
+            let source_bits = if arr_type == "Uint32Array" { 32 } else { 16 };
             let mut idx: Vec<u32> = read_buffer_array(bin, arr_def, 1, arr_type)?
                 .as_i64_vec()
                 .into_iter()
                 .map(|v| v as u32)
                 .collect();
-            let is_strip = draw.get("Mode").and_then(Value::as_str) == Some("TRIANGLE_STRIP");
             let tri_mode = num(meta.get("triangle_mode")) as u32;
+            let output_bits;
             if tri_mode & 4 != 0 && is_strip {
                 let start = 3 + idx.get(1).copied().unwrap_or(0) as usize;
                 if tri_mode & 1 != 0 {
-                    delta_decode(&mut idx, start);
+                    delta_decode(&mut idx, start, source_bits);
                 }
                 idx = implicit_decode(
                     &idx,
@@ -1231,19 +1277,30 @@ fn process_geometry(
                     start,
                     tri_mode & 2 != 0,
                 );
+                for value in &mut idx {
+                    *value &= 0xffff;
+                }
+                output_bits = 16;
             } else if tri_mode & 1 != 0 {
-                delta_decode(&mut idx, 0);
+                delta_decode(&mut idx, 0, source_bits);
+                output_bits = source_bits;
+            } else {
+                output_bits = source_bits;
             }
             if tri_mode & 2 != 0 {
-                expected_renumber(&mut idx);
+                expected_renumber(&mut idx, &mut expected_state, output_bits);
             }
-            strip_indices = if is_strip { Some(idx.clone()) } else { None };
-            indices = Some(if is_strip { strip_to_tris(&idx) } else { idx });
+            if is_strip {
+                strip_indices = Some(idx.clone());
+                indices.extend(strip_to_tris(&idx));
+            } else {
+                indices.extend(idx);
+            }
         }
     }
-    let Some(indices) = indices else {
+    if indices.is_empty() {
         return Ok(None);
-    };
+    }
 
     let mut attributes = HashMap::new();
     if let Some(va) = geom.get("VertexAttributeList").and_then(Value::as_object) {
@@ -1507,6 +1564,15 @@ fn bone_trs(bone: &Value) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (translation, rotation, scale)
 }
 
+fn without_numeric_suffix(name: &str) -> &str {
+    name.rsplit_once('_')
+        .filter(|(_, suffix)| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map(|(base, _)| base)
+        .unwrap_or(name)
+}
+
 fn add_bone_node(
     wrapper: &Value,
     nodes: &mut Vec<Value>,
@@ -1536,6 +1602,9 @@ fn add_bone_node(
     }
     nodes[index] = node;
     node_by_name.insert(name.clone(), index);
+    node_by_name
+        .entry(without_numeric_suffix(&name).to_owned())
+        .or_insert(index);
     if let Some(matrix) = bone.get("InvBindMatrixInSkeletonSpace") {
         inverse_bind_by_name.insert(
             name,
@@ -2173,7 +2242,11 @@ fn export_animation(
         let Some(target_name) = channel.get("TargetName").and_then(Value::as_str) else {
             continue;
         };
-        let Some(node) = node_by_name.get(target_name).copied() else {
+        let Some(node) = node_by_name
+            .get(target_name)
+            .or_else(|| node_by_name.get(without_numeric_suffix(target_name)))
+            .copied()
+        else {
             continue;
         };
         let Some(channel_name) = channel.get("Name").and_then(Value::as_str) else {
@@ -2191,7 +2264,7 @@ fn export_animation(
         let Some(key_frames) = channel.get("KeyFrames") else {
             continue;
         };
-        let times = decode_animation_array(
+        let mut times = decode_animation_array(
             animation_bin,
             &key_frames["Time"],
             &metadata,
@@ -2207,6 +2280,23 @@ fn export_animation(
             packed,
             components,
         )?;
+        if values.len() / components == times.len() {
+            let mut filtered_times = Vec::with_capacity(times.len());
+            let mut filtered_values = Vec::with_capacity(values.len());
+            for (index, time) in times.iter().copied().enumerate() {
+                if filtered_times.last().is_none_or(|last| time > *last) {
+                    filtered_times.push(time);
+                    filtered_values
+                        .extend_from_slice(&values[index * components..(index + 1) * components]);
+                } else if filtered_times.last() == Some(&time) {
+                    let start = filtered_values.len() - components;
+                    filtered_values[start..]
+                        .copy_from_slice(&values[index * components..(index + 1) * components]);
+                }
+            }
+            times = filtered_times;
+            values = filtered_values;
+        }
         if path == "rotation" {
             make_quaternions_continuous(&mut values);
         }
@@ -2369,6 +2459,7 @@ fn convert_to_glb(
         let mut material = json!({
             "name": source.name,
             "doubleSided": source.name != "OH_Outline_Material",
+            "alphaMode": source.alpha_mode,
             "pbrMetallicRoughness": {
                 "baseColorFactor": source.base_color,
                 "metallicFactor": source.metallic_factor,
@@ -2398,6 +2489,16 @@ fn convert_to_glb(
         {
             material["occlusionTexture"] =
                 json!({ "index": index, "texCoord": 0, "strength": 1.0 });
+        }
+        if let Some(index) = source
+            .normal_texture
+            .as_ref()
+            .and_then(|uid| texture_indices.get(uid))
+        {
+            material["normalTexture"] = json!({ "index": index, "texCoord": 0 });
+        }
+        if source.alpha_mode == "MASK" {
+            material["alphaCutoff"] = json!(source.alpha_cutoff);
         }
         let index = gltf["materials"].as_array().unwrap().len();
         gltf["materials"].as_array_mut().unwrap().push(material);
@@ -2498,6 +2599,9 @@ fn convert_to_glb(
     )?;
     if animation_channel_count == 0 {
         gltf.as_object_mut().unwrap().remove("animations");
+    }
+    if gltf["skins"].as_array().is_some_and(Vec::is_empty) {
+        gltf.as_object_mut().unwrap().remove("skins");
     }
     println!("  {animation_channel_count} animation channels exported");
     gltf["buffers"]
