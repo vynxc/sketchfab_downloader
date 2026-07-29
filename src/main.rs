@@ -1420,6 +1420,9 @@ fn process_geometry(
                         item_size,
                     );
                 }
+                for uv in data.chunks_exact_mut(item_size) {
+                    uv[1] = 1.0 - uv[1];
+                }
                 attributes.insert(
                     format!("_TC_{suffix}"),
                     Attribute {
@@ -1912,10 +1915,11 @@ fn traverse_geometries(
         return Ok(());
     }
     if let Some(rig) = v.get("osgAnimation.RigGeometry") {
-        if let Some(source) = rig
-            .get("SourceGeometry")
-            .and_then(|source| source.get("osg.Geometry"))
-        {
+        if let Some(source) = rig.get("SourceGeometry").and_then(|source| {
+            source
+                .get("osg.Geometry")
+                .or_else(|| source.get("osgAnimation.MorphGeometry"))
+        }) {
             let is_wire = source
                 .get("PrimitiveSetList")
                 .and_then(Value::as_array)
