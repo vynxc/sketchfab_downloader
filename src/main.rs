@@ -2,13 +2,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::Parser;
 use flate2::read::GzDecoder;
-use image::{ImageBuffer, Rgba};
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, imageops::FilterType};
 use rand::Rng;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use wasmtime::{
     Caller, Engine as WasmEngine, ExternType, Func, Linker, Memory, MemoryType, Module, Store, Val,
@@ -43,6 +43,8 @@ struct MaterialEntry {
     emissive_texture: Option<String>,
     occlusion_texture: Option<String>,
     normal_texture: Option<String>,
+    metallic_texture: Option<String>,
+    roughness_texture: Option<String>,
     metallic_factor: f32,
     roughness_factor: f32,
     alpha_mode: &'static str,
@@ -401,11 +403,15 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
             let emissive_texture = texture_uid(emissive);
             let occlusion_texture = texture_uid(occlusion);
             let normal_texture = texture_uid(normal);
+            let metallic_texture = texture_uid(metallic);
+            let roughness_texture = texture_uid(roughness);
             for uid in [
                 base_color_texture.as_ref(),
                 emissive_texture.as_ref(),
                 occlusion_texture.as_ref(),
                 normal_texture.as_ref(),
+                metallic_texture.as_ref(),
+                roughness_texture.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -442,6 +448,8 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
                     emissive_texture,
                     occlusion_texture,
                     normal_texture,
+                    metallic_texture,
+                    roughness_texture,
                     metallic_factor: metallic
                         .and_then(|v| v.get("factor"))
                         .and_then(Value::as_f64)
@@ -2153,13 +2161,6 @@ fn add_image_texture(gltf: &mut Value, bin: &mut Vec<u8>, path: &Path) -> Result
         return Ok(None);
     }
     let bytes = fs::read(path)?;
-    let (offset, len) = push_padded(bin, &bytes);
-    let bv_idx = gltf["bufferViews"].as_array().unwrap().len();
-    gltf["bufferViews"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({ "buffer": 0, "byteOffset": offset, "byteLength": len }));
-    let image_idx = gltf["images"].as_array().unwrap().len();
     let mime = if path
         .extension()
         .and_then(|s| s.to_str())
@@ -2169,6 +2170,17 @@ fn add_image_texture(gltf: &mut Value, bin: &mut Vec<u8>, path: &Path) -> Result
     } else {
         "image/jpeg"
     };
+    Ok(Some(add_image_texture_bytes(gltf, bin, &bytes, mime)))
+}
+
+fn add_image_texture_bytes(gltf: &mut Value, bin: &mut Vec<u8>, bytes: &[u8], mime: &str) -> usize {
+    let (offset, len) = push_padded(bin, &bytes);
+    let bv_idx = gltf["bufferViews"].as_array().unwrap().len();
+    gltf["bufferViews"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "buffer": 0, "byteOffset": offset, "byteLength": len }));
+    let image_idx = gltf["images"].as_array().unwrap().len();
     gltf["images"]
         .as_array_mut()
         .unwrap()
@@ -2178,7 +2190,70 @@ fn add_image_texture(gltf: &mut Value, bin: &mut Vec<u8>, path: &Path) -> Result
         .as_array_mut()
         .unwrap()
         .push(json!({ "source": image_idx, "sampler": 0 }));
-    Ok(Some(tex_idx))
+    tex_idx
+}
+
+fn texture_file<'a>(texture: &'a TextureEntry, texture_dir: &Path) -> PathBuf {
+    texture_dir.join(texture.clean_file.as_ref().unwrap_or(&texture.filename))
+}
+
+fn add_metallic_roughness_texture(
+    gltf: &mut Value,
+    bin: &mut Vec<u8>,
+    texture_dir: &Path,
+    metallic: Option<&TextureEntry>,
+    roughness: Option<&TextureEntry>,
+) -> Result<Option<usize>> {
+    let load = |texture: Option<&TextureEntry>| -> Result<Option<image::GrayImage>> {
+        let Some(texture) = texture else {
+            return Ok(None);
+        };
+        let path = texture_file(texture, texture_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(image::open(path)?.to_luma8()))
+    };
+    let mut metallic = load(metallic)?;
+    let mut roughness = load(roughness)?;
+    let Some((width, height)) = metallic
+        .as_ref()
+        .map(|image| image.dimensions())
+        .or_else(|| roughness.as_ref().map(|image| image.dimensions()))
+    else {
+        return Ok(None);
+    };
+    if metallic
+        .as_ref()
+        .is_some_and(|image| image.dimensions() != (width, height))
+    {
+        metallic = metallic
+            .map(|image| image::imageops::resize(&image, width, height, FilterType::Triangle));
+    }
+    if roughness
+        .as_ref()
+        .is_some_and(|image| image.dimensions() != (width, height))
+    {
+        roughness = roughness
+            .map(|image| image::imageops::resize(&image, width, height, FilterType::Triangle));
+    }
+    let packed = ImageBuffer::from_fn(width, height, |x, y| {
+        let metal = metallic
+            .as_ref()
+            .map_or(255, |image| image.get_pixel(x, y)[0]);
+        let rough = roughness
+            .as_ref()
+            .map_or(255, |image| image.get_pixel(x, y)[0]);
+        Rgba([255, rough, metal, 255])
+    });
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(packed).write_to(&mut bytes, ImageFormat::Png)?;
+    Ok(Some(add_image_texture_bytes(
+        gltf,
+        bin,
+        bytes.get_ref(),
+        "image/png",
+    )))
 }
 
 fn user_data_values(value: &Value) -> HashMap<String, Value> {
@@ -2540,6 +2615,20 @@ fn export_animations_from_scene(
     Ok(count)
 }
 
+fn is_black_line_material(name: &str, material: Option<&MaterialEntry>) -> bool {
+    let lower_name = name.to_ascii_lowercase();
+    let material_leaf = lower_name
+        .rsplit([':', '/', '\\'])
+        .next()
+        .unwrap_or(&lower_name);
+    material_leaf.starts_with("line")
+        && material.is_some_and(|material| {
+            material.base_color_texture.is_none()
+                && material.emissive_texture.is_none()
+                && material.base_color[..3].iter().all(|value| *value <= 0.01)
+        })
+}
+
 fn convert_to_glb(
     osgjs: &Value,
     poly_bin: &[u8],
@@ -2562,13 +2651,7 @@ fn convert_to_glb(
         if lower_name.contains("outline") {
             return false;
         }
-        let is_black_line_material = lower_name.starts_with("line")
-            && source_materials.get(name).is_some_and(|material| {
-                material.base_color_texture.is_none()
-                    && material.emissive_texture.is_none()
-                    && material.base_color[..3].iter().all(|value| *value <= 0.01)
-            });
-        !is_black_line_material
+        !is_black_line_material(name, source_materials.get(name))
     });
     println!("  {} geometries found", geometries.len());
     let resolved = resolved_scene(osgjs);
@@ -2608,13 +2691,13 @@ fn convert_to_glb(
     texture_uids.sort();
     for uid in texture_uids {
         let tex = &texture_files[&uid];
-        let name = tex.clean_file.as_ref().unwrap_or(&tex.filename);
-        if let Some(idx) = add_image_texture(&mut gltf, &mut bin, &tex_dir.join(name))? {
+        if let Some(idx) = add_image_texture(&mut gltf, &mut bin, &texture_file(tex, &tex_dir))? {
             texture_indices.insert(uid, idx);
         }
     }
 
     let mut material_indices = HashMap::new();
+    let mut metallic_roughness_indices = HashMap::new();
     let mut material_names = source_materials.keys().cloned().collect::<Vec<_>>();
     material_names.sort();
     for name in material_names {
@@ -2659,6 +2742,37 @@ fn convert_to_glb(
             .and_then(|uid| texture_indices.get(uid))
         {
             material["normalTexture"] = json!({ "index": index, "texCoord": 0 });
+        }
+        if source.metallic_texture.is_some() || source.roughness_texture.is_some() {
+            let key = (
+                source.metallic_texture.clone(),
+                source.roughness_texture.clone(),
+            );
+            let packed_index = if let Some(index) = metallic_roughness_indices.get(&key) {
+                Some(*index)
+            } else {
+                let index = add_metallic_roughness_texture(
+                    &mut gltf,
+                    &mut bin,
+                    &tex_dir,
+                    source
+                        .metallic_texture
+                        .as_ref()
+                        .and_then(|uid| texture_files.get(uid)),
+                    source
+                        .roughness_texture
+                        .as_ref()
+                        .and_then(|uid| texture_files.get(uid)),
+                )?;
+                if let Some(index) = index {
+                    metallic_roughness_indices.insert(key, index);
+                }
+                index
+            };
+            if let Some(index) = packed_index {
+                material["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
+                    json!({ "index": index, "texCoord": 0 });
+            }
         }
         if source.alpha_mode == "MASK" {
             material["alphaCutoff"] = json!(source.alpha_cutoff);
@@ -2800,4 +2914,40 @@ fn write_glb(gltf: &Value, bin: &[u8]) -> Result<Vec<u8>> {
     out.extend_from_slice(&0x004e4942u32.to_le_bytes());
     out.extend_from_slice(&bin_bytes);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn black_material() -> MaterialEntry {
+        MaterialEntry {
+            name: "line".to_owned(),
+            base_color: [0.0, 0.0, 0.0, 1.0],
+            base_color_texture: None,
+            emissive_color: [0.0, 0.0, 0.0],
+            emissive_texture: None,
+            occlusion_texture: None,
+            normal_texture: None,
+            metallic_texture: None,
+            roughness_texture: None,
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            alpha_mode: "OPAQUE",
+            alpha_cutoff: 0.5,
+        }
+    }
+
+    #[test]
+    fn filters_namespaced_black_line_materials() {
+        let material = black_material();
+        assert!(is_black_line_material("model:model:Linea", Some(&material)));
+    }
+
+    #[test]
+    fn preserves_textured_line_materials() {
+        let mut material = black_material();
+        material.base_color_texture = Some("texture".to_owned());
+        assert!(!is_black_line_material("LineArt", Some(&material)));
+    }
 }
