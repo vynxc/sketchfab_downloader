@@ -16,7 +16,7 @@ use wasmtime::{
 };
 
 const STATIC_KEY: &str = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
-const WORK_DIR: &str = ".cache";
+const CACHE_DIR: &str = ".cache";
 
 #[derive(Parser)]
 #[command(version, about = "Download Sketchfab embed models as glTF 2.0 GLB")]
@@ -55,6 +55,7 @@ struct AnimationEntry {
 
 #[derive(Debug)]
 struct ModelConfig {
+    work_dir: PathBuf,
     base_url: String,
     diter_b: String,
     static_key: String,
@@ -149,9 +150,9 @@ fn main() -> Result<()> {
         }
     };
 
-    let osgjs: Value = serde_json::from_slice(&fs::read(Path::new(WORK_DIR).join("file.osgjs"))?)?;
-    let poly_bin = fs::read(Path::new(WORK_DIR).join("model_file.bin"))?;
-    let wire_path = Path::new(WORK_DIR).join("model_file_wireframe.bin");
+    let osgjs: Value = serde_json::from_slice(&fs::read(config.work_dir.join("file.osgjs"))?)?;
+    let poly_bin = fs::read(config.work_dir.join("model_file.bin"))?;
+    let wire_path = config.work_dir.join("model_file_wireframe.bin");
     let wire_bin = if wire_path.exists() {
         Some(fs::read(wire_path)?)
     } else {
@@ -164,7 +165,8 @@ fn main() -> Result<()> {
             Ok((
                 animation.name.to_ascii_lowercase(),
                 fs::read(
-                    Path::new(WORK_DIR)
+                    config
+                        .work_dir
                         .join("animations")
                         .join(format!("{}.bin", animation.uid)),
                 )?,
@@ -178,6 +180,7 @@ fn main() -> Result<()> {
         &texture_files,
         &config.materials,
         &animation_bins,
+        &config.work_dir,
     )?;
     fs::write(&output, &glb)?;
     println!(
@@ -489,6 +492,7 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
         .collect();
 
     Ok(ModelConfig {
+        work_dir: Path::new(CACHE_DIR).join(uid),
         base_url,
         diter_b: p_caps[2].to_owned(),
         static_key,
@@ -500,10 +504,10 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
 
 fn download_files(config: &ModelConfig) -> Result<()> {
     println!("[2/6] Downloading model files...");
-    fs::create_dir_all(Path::new(WORK_DIR).join("textures"))?;
-    fs::create_dir_all(Path::new(WORK_DIR).join("animations"))?;
+    fs::create_dir_all(config.work_dir.join("textures"))?;
+    fs::create_dir_all(config.work_dir.join("animations"))?;
     for name in ["file.binz", "model_file.binz", "model_file_wireframe.binz"] {
-        let dest = Path::new(WORK_DIR).join(name);
+        let dest = config.work_dir.join(name);
         if !dest.exists() {
             let data = fetch(&format!("{}/{}", config.base_url, name))?;
             fs::write(&dest, &data)?;
@@ -511,7 +515,7 @@ fn download_files(config: &ModelConfig) -> Result<()> {
         }
     }
     for (channel, tex) in &config.texture_map {
-        let dest = Path::new(WORK_DIR).join("textures").join(&tex.filename);
+        let dest = config.work_dir.join("textures").join(&tex.filename);
         if !dest.exists() {
             let data = fetch(&tex.url)?;
             fs::write(&dest, &data)?;
@@ -519,10 +523,12 @@ fn download_files(config: &ModelConfig) -> Result<()> {
         }
     }
     for animation in &config.animations {
-        let compressed = Path::new(WORK_DIR)
+        let compressed = config
+            .work_dir
             .join("animations")
             .join(format!("{}.bin.gz", animation.uid));
-        let raw = Path::new(WORK_DIR)
+        let raw = config
+            .work_dir
             .join("animations")
             .join(format!("{}.bin", animation.uid));
         if !compressed.exists() {
@@ -783,12 +789,12 @@ fn decrypt_all(config: &ModelConfig) -> Result<()> {
         ("model_file.binz", "model_file.bin"),
         ("model_file_wireframe.binz", "model_file_wireframe.bin"),
     ] {
-        let dst_path = Path::new(WORK_DIR).join(dst);
+        let dst_path = config.work_dir.join(dst);
         if dst_path.exists() {
             continue;
         }
         let result = decrypt_binz(
-            &Path::new(WORK_DIR).join(src),
+            &config.work_dir.join(src),
             &config.diter_b,
             &config.static_key,
         )?;
@@ -856,13 +862,13 @@ fn descramble_textures(config: &ModelConfig) -> Result<HashMap<String, TextureEn
     println!("[4/6] Descrambling textures...");
     let mut clean = HashMap::new();
     for (uid, tex) in &config.texture_map {
-        let src = Path::new(WORK_DIR).join("textures").join(&tex.filename);
+        let src = config.work_dir.join("textures").join(&tex.filename);
         let Some(pk) = tex.pk else {
             clean.insert(uid.clone(), tex.clone());
             continue;
         };
         let clean_name = format!("{}_clean.png", tex.uid);
-        let dst = Path::new(WORK_DIR).join("textures").join(&clean_name);
+        let dst = config.work_dir.join("textures").join(&clean_name);
         let mut next = tex.clone();
         next.clean_file = Some(clean_name.clone());
         if dst.exists() {
@@ -872,10 +878,9 @@ fn descramble_textures(config: &ModelConfig) -> Result<HashMap<String, TextureEn
         let img = image::open(&src)?.to_rgba8();
         let (w, h) = img.dimensions();
         if w % 8 != 0 || h % 8 != 0 {
-            bail!(
-                "texture {} dimensions are not divisible by 8",
-                src.display()
-            );
+            println!("  {uid}: keeping original texture ({w}x{h} is not divisible by 8)");
+            clean.insert(uid.clone(), tex.clone());
+            continue;
         }
         println!("  {uid}: {w}x{h} pk={pk}");
         let total = (w * h) as usize;
@@ -2271,14 +2276,15 @@ fn export_animations_from_scene(
             .and_then(Value::as_str)
             .unwrap_or("Animation")
             .to_ascii_lowercase();
-        let animation_bin = animation_bins
-            .get(&name)
-            .or_else(|| {
-                (animation_bins.len() == 1)
-                    .then(|| animation_bins.values().next())
-                    .flatten()
-            })
-            .ok_or_else(|| anyhow!("animation binary not found for {name}"))?;
+        let animation_bin = animation_bins.get(&name).or_else(|| {
+            (animation_bins.len() == 1)
+                .then(|| animation_bins.values().next())
+                .flatten()
+        });
+        let Some(animation_bin) = animation_bin else {
+            println!("  Skipping animation {name}: binary not available");
+            return Ok(0);
+        };
         return export_animation(animation, animation_bin, node_by_name, gltf, bin);
     }
     let mut count = 0;
@@ -2307,6 +2313,7 @@ fn convert_to_glb(
     texture_files: &HashMap<String, TextureEntry>,
     source_materials: &HashMap<String, MaterialEntry>,
     animation_bins: &HashMap<String, Vec<u8>>,
+    work_dir: &Path,
 ) -> Result<Vec<u8>> {
     println!("[5/6] Converting to glTF...");
     let geometries = collect_geometries(osgjs, poly_bin, wire_bin)?;
@@ -2342,7 +2349,7 @@ fn convert_to_glb(
         "samplers": [{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]
     });
     let mut bin = Vec::new();
-    let tex_dir = Path::new(WORK_DIR).join("textures");
+    let tex_dir = work_dir.join("textures");
     let mut texture_indices = HashMap::new();
     let mut texture_uids = texture_files.keys().cloned().collect::<Vec<_>>();
     texture_uids.sort();
@@ -2489,6 +2496,9 @@ fn convert_to_glb(
         &mut gltf,
         &mut bin,
     )?;
+    if animation_channel_count == 0 {
+        gltf.as_object_mut().unwrap().remove("animations");
+    }
     println!("  {animation_channel_count} animation channels exported");
     gltf["buffers"]
         .as_array_mut()
