@@ -115,6 +115,7 @@ struct Geometry {
     attributes: HashMap<String, Attribute>,
     material_name: Option<String>,
     joint_names: Vec<String>,
+    matrix: [f32; 16],
 }
 
 fn main() -> Result<()> {
@@ -1468,6 +1469,7 @@ fn process_geometry(
         attributes,
         material_name,
         joint_names: Vec::new(),
+        matrix: matrix16(None),
     }))
 }
 
@@ -1572,13 +1574,15 @@ fn without_numeric_suffix(name: &str) -> &str {
 
 fn add_bone_node(
     wrapper: &Value,
+    parent_matrix: &[f32; 16],
     nodes: &mut Vec<Value>,
     node_by_name: &mut HashMap<String, usize>,
-    inverse_bind_by_name: &mut HashMap<String, Vec<f32>>,
+    global_bind_by_name: &mut HashMap<String, [f32; 16]>,
 ) -> Option<usize> {
     let bone = wrapper.get("osgAnimation.Bone")?;
     let name = bone.get("Name")?.as_str()?.to_owned();
     let (translation, rotation, scale) = bone_trs(bone);
+    let global_matrix = multiply_matrices(parent_matrix, &matrix16(bone.get("Matrix")));
     let index = nodes.len();
     nodes.push(Value::Null);
     let children = bone
@@ -1586,7 +1590,15 @@ fn add_bone_node(
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|child| add_bone_node(child, nodes, node_by_name, inverse_bind_by_name))
+        .filter_map(|child| {
+            add_bone_node(
+                child,
+                &global_matrix,
+                nodes,
+                node_by_name,
+                global_bind_by_name,
+            )
+        })
         .collect::<Vec<_>>();
     let mut node = json!({
         "name": name,
@@ -1602,18 +1614,7 @@ fn add_bone_node(
     node_by_name
         .entry(without_numeric_suffix(&name).to_owned())
         .or_insert(index);
-    if let Some(matrix) = bone.get("InvBindMatrixInSkeletonSpace") {
-        inverse_bind_by_name.insert(
-            name,
-            vec_from(
-                Some(matrix),
-                16,
-                &[
-                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-                ],
-            ),
-        );
-    }
+    global_bind_by_name.insert(name, global_matrix);
     Some(index)
 }
 
@@ -1640,13 +1641,50 @@ fn multiply_matrices(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     out
 }
 
+fn invert_affine_matrix(matrix: &[f32; 16]) -> Option<[f32; 16]> {
+    let (a00, a01, a02) = (matrix[0], matrix[4], matrix[8]);
+    let (a10, a11, a12) = (matrix[1], matrix[5], matrix[9]);
+    let (a20, a21, a22) = (matrix[2], matrix[6], matrix[10]);
+    let determinant = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20)
+        + a02 * (a10 * a21 - a11 * a20);
+    if determinant.abs() < 1e-12 {
+        return None;
+    }
+    let d = determinant.recip();
+    let mut inverse = [
+        (a11 * a22 - a12 * a21) * d,
+        (a12 * a20 - a10 * a22) * d,
+        (a10 * a21 - a11 * a20) * d,
+        0.0,
+        (a02 * a21 - a01 * a22) * d,
+        (a00 * a22 - a02 * a20) * d,
+        (a01 * a20 - a00 * a21) * d,
+        0.0,
+        (a01 * a12 - a02 * a11) * d,
+        (a02 * a10 - a00 * a12) * d,
+        (a00 * a11 - a01 * a10) * d,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    let translation = [matrix[12], matrix[13], matrix[14]];
+    for row in 0..3 {
+        inverse[12 + row] = -(inverse[row] * translation[0]
+            + inverse[4 + row] * translation[1]
+            + inverse[8 + row] * translation[2]);
+    }
+    Some(inverse)
+}
+
 fn collect_skeleton_nodes(
     value: &Value,
     parent_matrix: &[f32; 16],
     nodes: &mut Vec<Value>,
     scene_roots: &mut Vec<usize>,
     node_by_name: &mut HashMap<String, usize>,
-    inverse_bind_by_name: &mut HashMap<String, Vec<f32>>,
+    global_bind_by_name: &mut HashMap<String, [f32; 16]>,
     seen: &mut HashSet<u64>,
 ) {
     if let Some(skeleton) = value.get("osgAnimation.Skeleton") {
@@ -1657,7 +1695,15 @@ fn collect_skeleton_nodes(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|child| add_bone_node(child, nodes, node_by_name, inverse_bind_by_name))
+                .filter_map(|child| {
+                    add_bone_node(
+                        child,
+                        &matrix16(None),
+                        nodes,
+                        node_by_name,
+                        global_bind_by_name,
+                    )
+                })
                 .collect::<Vec<_>>();
             let root_index = nodes.len();
             let mut root = json!({
@@ -1691,7 +1737,7 @@ fn collect_skeleton_nodes(
                     nodes,
                     scene_roots,
                     node_by_name,
-                    inverse_bind_by_name,
+                    global_bind_by_name,
                     seen,
                 );
             }
@@ -1707,7 +1753,7 @@ fn collect_skeleton_nodes(
                     nodes,
                     scene_roots,
                     node_by_name,
-                    inverse_bind_by_name,
+                    global_bind_by_name,
                     seen,
                 );
             }
@@ -1720,7 +1766,7 @@ fn collect_skeleton_nodes(
                     nodes,
                     scene_roots,
                     node_by_name,
-                    inverse_bind_by_name,
+                    global_bind_by_name,
                     seen,
                 );
             }
@@ -1737,7 +1783,14 @@ fn collect_geometries(
     let root = resolved_scene(osgjs);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    traverse_geometries(&root, poly_bin, wire_bin, &mut out, &mut seen)?;
+    traverse_geometries(
+        &root,
+        poly_bin,
+        wire_bin,
+        &matrix16(None),
+        &mut out,
+        &mut seen,
+    )?;
     Ok(out)
 }
 
@@ -1821,9 +1874,25 @@ fn traverse_geometries(
     v: &Value,
     poly_bin: &[u8],
     wire_bin: Option<&[u8]>,
+    parent_matrix: &[f32; 16],
     out: &mut Vec<Geometry>,
     seen: &mut HashSet<u64>,
 ) -> Result<()> {
+    if let Some(transform) = v.get("osg.MatrixTransform") {
+        let local = matrix16(transform.get("Matrix"));
+        let combined =
+            if transform.get("Name").and_then(Value::as_str) == Some("GLTF_SceneRootNode") {
+                *parent_matrix
+            } else {
+                multiply_matrices(parent_matrix, &local)
+            };
+        if let Some(children) = transform.get("Children").and_then(Value::as_array) {
+            for child in children {
+                traverse_geometries(child, poly_bin, wire_bin, &combined, out, seen)?;
+            }
+        }
+        return Ok(());
+    }
     if let Some(rig) = v.get("osgAnimation.RigGeometry") {
         if let Some(source) = rig
             .get("SourceGeometry")
@@ -1845,6 +1914,7 @@ fn traverse_geometries(
                 match process_geometry(source, poly_bin, wire_bin) {
                     Ok(Some(mut geometry)) => {
                         add_rig_attributes(&mut geometry, rig, poly_bin)?;
+                        geometry.matrix = *parent_matrix;
                         out.push(geometry);
                     }
                     Ok(None) => {}
@@ -1873,7 +1943,10 @@ fn traverse_geometries(
                 }
             }
             match process_geometry(geom, poly_bin, wire_bin) {
-                Ok(Some(g)) => out.push(g),
+                Ok(Some(mut geometry)) => {
+                    geometry.matrix = *parent_matrix;
+                    out.push(geometry);
+                }
                 Ok(None) => {}
                 Err(e) => eprintln!("  Warning: skipping geometry: {e}"),
             }
@@ -1887,7 +1960,7 @@ fn traverse_geometries(
     ] {
         if let Some(children) = v.pointer(ptr).and_then(Value::as_array) {
             for child in children {
-                traverse_geometries(child, poly_bin, wire_bin, out, seen)?;
+                traverse_geometries(child, poly_bin, wire_bin, parent_matrix, out, seen)?;
             }
         }
     }
@@ -2403,22 +2476,52 @@ fn convert_to_glb(
     work_dir: &Path,
 ) -> Result<Vec<u8>> {
     println!("[5/6] Converting to glTF...");
-    let geometries = collect_geometries(osgjs, poly_bin, wire_bin)?;
+    let mut geometries = collect_geometries(osgjs, poly_bin, wire_bin)?;
+    geometries.retain(|geometry| {
+        let Some(name) = geometry.material_name.as_ref() else {
+            return true;
+        };
+        let lower_name = name.to_ascii_lowercase();
+        if lower_name.contains("outline") {
+            return false;
+        }
+        let is_black_line_material = lower_name.starts_with("line")
+            && source_materials.get(name).is_some_and(|material| {
+                material.base_color_texture.is_none()
+                    && material.emissive_texture.is_none()
+                    && material.base_color[..3].iter().all(|value| *value <= 0.01)
+            });
+        !is_black_line_material
+    });
     println!("  {} geometries found", geometries.len());
     let resolved = resolved_scene(osgjs);
     let mut nodes = Vec::new();
     let mut scene_roots = Vec::new();
     let mut node_by_name = HashMap::new();
-    let mut inverse_bind_by_name = HashMap::new();
+    let mut global_bind_by_name = HashMap::new();
     collect_skeleton_nodes(
         &resolved,
         &matrix16(None),
         &mut nodes,
         &mut scene_roots,
         &mut node_by_name,
-        &mut inverse_bind_by_name,
+        &mut global_bind_by_name,
         &mut HashSet::new(),
     );
+    let skeleton_roots = scene_roots.clone();
+    let shared_matrix = geometries
+        .iter()
+        .find(|geometry| !geometry.joint_names.is_empty())
+        .map(|geometry| geometry.matrix);
+    let shared_inverse = shared_matrix.as_ref().and_then(invert_affine_matrix);
+    let mut shared_children = Vec::new();
+    if shared_matrix.is_some() {
+        for root_index in &skeleton_roots {
+            nodes[*root_index]["matrix"] = json!(matrix16(None));
+        }
+        shared_children.extend(skeleton_roots.iter().copied());
+        scene_roots.clear();
+    }
     let mut gltf = json!({
         "asset": { "version": "2.0", "generator": "sketchfab-downloader-rust" },
         "scene": 0,
@@ -2545,9 +2648,14 @@ fn convert_to_glb(
                     .unwrap_or(fallback_material)
             }]
         }));
+        let mesh_matrix = shared_inverse
+            .as_ref()
+            .map(|inverse| multiply_matrices(inverse, &geom.matrix))
+            .unwrap_or(geom.matrix);
         let mut mesh_node = json!({
             "name": format!("mesh_{mesh_index}"),
-            "mesh": mesh_index
+            "mesh": mesh_index,
+            "matrix": mesh_matrix
         });
         if !geom.joint_names.is_empty() {
             let joints = geom
@@ -2556,18 +2664,16 @@ fn convert_to_glb(
                 .filter_map(|name| node_by_name.get(name).copied())
                 .collect::<Vec<_>>();
             if joints.len() == geom.joint_names.len() {
-                let identity = vec![
-                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-                ];
+                let identity = matrix16(None);
                 let inverse_bind_matrices = geom
                     .joint_names
                     .iter()
                     .flat_map(|name| {
-                        inverse_bind_by_name
+                        global_bind_by_name
                             .get(name)
-                            .unwrap_or(&identity)
-                            .iter()
-                            .copied()
+                            .and_then(invert_affine_matrix)
+                            .unwrap_or(identity)
+                            .into_iter()
                     })
                     .collect::<Vec<_>>();
                 let inverse_bind_accessor =
@@ -2583,7 +2689,20 @@ fn convert_to_glb(
         }
         let node_index = nodes.len();
         nodes.push(mesh_node);
-        scene_roots.push(node_index);
+        if shared_matrix.is_some() {
+            shared_children.push(node_index);
+        } else {
+            scene_roots.push(node_index);
+        }
+    }
+    if let Some(matrix) = shared_matrix {
+        let root_index = nodes.len();
+        nodes.push(json!({
+            "name": "ModelRoot",
+            "matrix": matrix,
+            "children": shared_children
+        }));
+        scene_roots.push(root_index);
     }
     gltf["nodes"] = json!(nodes);
     gltf["scenes"][0]["nodes"] = json!(scene_roots);
