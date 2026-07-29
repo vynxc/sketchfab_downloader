@@ -2050,6 +2050,23 @@ fn cumulative_quaternions(values: &mut [f32]) {
     }
 }
 
+fn make_quaternions_continuous(values: &mut [f32]) {
+    for index in 1..values.len() / 4 {
+        let previous = (index - 1) * 4;
+        let current = index * 4;
+        let dot = values[previous] * values[current]
+            + values[previous + 1] * values[current + 1]
+            + values[previous + 2] * values[current + 2]
+            + values[previous + 3] * values[current + 3];
+        if dot < 0.0 {
+            values[current] = -values[current];
+            values[current + 1] = -values[current + 1];
+            values[current + 2] = -values[current + 2];
+            values[current + 3] = -values[current + 3];
+        }
+    }
+}
+
 fn decode_animation_array(
     animation_bin: &[u8],
     definition: &Value,
@@ -2073,10 +2090,12 @@ fn decode_animation_array(
     }
     let mode = num(metadata.get("channel_mode")) as u32;
     if components == 4 && mode & 8 != 0 {
+        let epsilon = meta_value(metadata, "epsilon");
+        let nphi = meta_value(metadata, "nphi");
         values = decode_quaternion_keys(
             &values,
-            meta_value(metadata, "epsilon").max(0.25),
-            meta_value(metadata, "nphi").max(720.0),
+            if epsilon == 0.0 { 0.25 } else { epsilon },
+            if nphi == 0.0 { 720.0 } else { nphi },
         );
         if compressed && mode & 4 != 0 {
             let mut with_origin = vec![
@@ -2175,7 +2194,7 @@ fn export_animation(
             false,
             1,
         )?;
-        let values = decode_animation_array(
+        let mut values = decode_animation_array(
             animation_bin,
             &key_frames["Key"],
             &metadata,
@@ -2183,6 +2202,9 @@ fn export_animation(
             packed,
             components,
         )?;
+        if path == "rotation" {
+            make_quaternions_continuous(&mut values);
+        }
         if times.is_empty() || values.len() / components != times.len() {
             continue;
         }
