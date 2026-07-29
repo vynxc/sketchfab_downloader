@@ -35,20 +35,54 @@ struct TextureEntry {
 }
 
 #[derive(Clone, Debug)]
+struct TextureUse {
+    uid: String,
+    texcoord_unit: u32,
+    transform: TextureTransform,
+    sampler: SamplerSettings,
+    alpha_channel: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TextureTransform {
+    offset: [f32; 2],
+    scale: [f32; 2],
+    rotation: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SamplerSettings {
+    mag_filter: u32,
+    min_filter: u32,
+    wrap_s: u32,
+    wrap_t: u32,
+}
+
+#[derive(Clone, Debug)]
 struct MaterialEntry {
     name: String,
     base_color: [f32; 4],
-    base_color_texture: Option<String>,
+    base_color_texture: Option<TextureUse>,
     emissive_color: [f32; 3],
-    emissive_texture: Option<String>,
-    occlusion_texture: Option<String>,
-    normal_texture: Option<String>,
-    metallic_texture: Option<String>,
-    roughness_texture: Option<String>,
+    emissive_enabled: bool,
+    emissive_texture: Option<TextureUse>,
+    occlusion_texture: Option<TextureUse>,
+    normal_texture: Option<TextureUse>,
+    metallic_texture: Option<TextureUse>,
+    roughness_texture: Option<TextureUse>,
+    roughness_invert: bool,
+    opacity_texture: Option<TextureUse>,
+    alpha_mask_texture: Option<TextureUse>,
+    alpha_invert: bool,
+    normal_scale: f32,
+    normal_flip_y: bool,
     metallic_factor: f32,
     roughness_factor: f32,
     alpha_mode: &'static str,
     alpha_cutoff: f32,
+    double_sided: bool,
+    unlit: bool,
+    extensions: Map<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +101,10 @@ struct ModelConfig {
     texture_map: HashMap<String, TextureEntry>,
     materials: HashMap<String, MaterialEntry>,
     animations: Vec<AnimationEntry>,
+    vertex_colors: bool,
+    vertex_color_alpha: bool,
+    vertex_color_srgb: bool,
+    flip_uvs: bool,
 }
 
 #[derive(Clone)]
@@ -114,11 +152,33 @@ struct Attribute {
 
 struct Geometry {
     indices: Vec<u32>,
+    mode: u32,
     attributes: HashMap<String, Attribute>,
+    morph_targets: Vec<MorphTarget>,
+    texcoord_units: HashMap<u32, u32>,
     material_name: Option<String>,
     joint_names: Vec<String>,
     matrix: [f32; 16],
     skeleton_matrix: Option<[f32; 16]>,
+    animation_target: Option<String>,
+}
+
+struct MorphTarget {
+    name: String,
+    attributes: HashMap<String, Attribute>,
+}
+
+#[derive(Clone, Copy)]
+struct MorphTargetBinding {
+    node: usize,
+    target_index: usize,
+    target_count: usize,
+}
+
+#[derive(Clone)]
+struct ScalarTrack {
+    times: Vec<f32>,
+    values: Vec<f32>,
 }
 
 fn main() -> Result<()> {
@@ -188,6 +248,10 @@ fn main() -> Result<()> {
         &config.materials,
         &animation_bins,
         &config.work_dir,
+        config.vertex_colors,
+        config.vertex_color_alpha,
+        config.vertex_color_srgb,
+        config.flip_uvs,
     )?;
     fs::write(&output, &glb)?;
     println!(
@@ -331,11 +395,67 @@ fn enabled_channel<'a>(material: &'a Value, name: &str) -> Option<&'a Value> {
         .then_some(channel)
 }
 
-fn texture_uid(channel: Option<&Value>) -> Option<String> {
-    channel?
-        .pointer("/texture/uid")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+fn texture_filter(value: Option<&str>, default: u32) -> u32 {
+    match value {
+        Some("NEAREST") => 9728,
+        Some("LINEAR") => 9729,
+        Some("NEAREST_MIPMAP_NEAREST") => 9984,
+        Some("LINEAR_MIPMAP_NEAREST") => 9985,
+        Some("NEAREST_MIPMAP_LINEAR") => 9986,
+        Some("LINEAR_MIPMAP_LINEAR") => 9987,
+        _ => default,
+    }
+}
+
+fn texture_wrap(value: Option<&str>) -> u32 {
+    match value {
+        Some("CLAMP_TO_EDGE") => 33071,
+        Some("MIRRORED_REPEAT") => 33648,
+        _ => 10497,
+    }
+}
+
+fn vec2(value: Option<&Value>, default: [f32; 2]) -> [f32; 2] {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return default;
+    };
+    [
+        values
+            .first()
+            .and_then(Value::as_f64)
+            .unwrap_or(default[0] as f64) as f32,
+        values
+            .get(1)
+            .and_then(Value::as_f64)
+            .unwrap_or(default[1] as f64) as f32,
+    ]
+}
+
+fn texture_use(channel: Option<&Value>) -> Option<TextureUse> {
+    let channel = channel?;
+    let texture = channel.get("texture")?;
+    Some(TextureUse {
+        uid: texture.get("uid")?.as_str()?.to_owned(),
+        texcoord_unit: texture
+            .get("texCoordUnit")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        transform: TextureTransform {
+            offset: vec2(channel.pointer("/UVTransforms/offset"), [0.0, 0.0]),
+            scale: vec2(channel.pointer("/UVTransforms/scale"), [1.0, 1.0]),
+            rotation: channel
+                .pointer("/UVTransforms/rotation")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32,
+        },
+        sampler: SamplerSettings {
+            mag_filter: texture_filter(texture.get("magFilter").and_then(Value::as_str), 9729),
+            min_filter: texture_filter(texture.get("minFilter").and_then(Value::as_str), 9987),
+            wrap_s: texture_wrap(texture.get("wrapS").and_then(Value::as_str)),
+            wrap_t: texture_wrap(texture.get("wrapT").and_then(Value::as_str)),
+        },
+        alpha_channel: texture.get("internalFormat").and_then(Value::as_str) == Some("ALPHA"),
+    })
 }
 
 fn color3(channel: Option<&Value>, default: [f32; 3]) -> [f32; 3] {
@@ -382,6 +502,10 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
 
     let mut materials = HashMap::new();
     let mut wanted_textures = HashSet::new();
+    let global_unlit = model
+        .pointer("/options/shading/type")
+        .and_then(Value::as_str)
+        == Some("shadeless");
     if let Some(source_materials) = model
         .pointer("/options/materials")
         .and_then(Value::as_object)
@@ -396,27 +520,33 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
             let occlusion = enabled_channel(material, "AOPBR");
             let normal = enabled_channel(material, "NormalMap");
             let metallic = enabled_channel(material, "MetalnessPBR");
-            let roughness = enabled_channel(material, "RoughnessPBR");
+            let roughness_channel = enabled_channel(material, "RoughnessPBR");
+            let glossiness_channel = enabled_channel(material, "GlossinessPBR");
+            let roughness = roughness_channel.or(glossiness_channel);
             let opacity = enabled_channel(material, "Opacity");
             let alpha_mask = enabled_channel(material, "AlphaMask");
-            let base_color_texture = texture_uid(diffuse);
-            let emissive_texture = texture_uid(emissive);
-            let occlusion_texture = texture_uid(occlusion);
-            let normal_texture = texture_uid(normal);
-            let metallic_texture = texture_uid(metallic);
-            let roughness_texture = texture_uid(roughness);
-            for uid in [
+            let base_color_texture = texture_use(diffuse);
+            let emissive_texture = texture_use(emissive);
+            let occlusion_texture = texture_use(occlusion);
+            let normal_texture = texture_use(normal);
+            let metallic_texture = texture_use(metallic);
+            let roughness_texture = texture_use(roughness);
+            let opacity_texture = texture_use(opacity);
+            let alpha_mask_texture = texture_use(alpha_mask);
+            for texture in [
                 base_color_texture.as_ref(),
                 emissive_texture.as_ref(),
                 occlusion_texture.as_ref(),
                 normal_texture.as_ref(),
                 metallic_texture.as_ref(),
                 roughness_texture.as_ref(),
+                opacity_texture.as_ref(),
+                alpha_mask_texture.as_ref(),
             ]
             .into_iter()
             .flatten()
             {
-                wanted_textures.insert(uid.clone());
+                wanted_textures.insert(texture.uid.clone());
             }
             let base_rgb = color3(diffuse, [1.0, 1.0, 1.0]);
             let emissive_factor = emissive
@@ -438,6 +568,35 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
                 .and_then(|v| v.get("factor"))
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0) as f32;
+            let mut extensions = Map::new();
+            if let Some(clearcoat) = enabled_channel(material, "ClearCoat") {
+                let factor = clearcoat
+                    .get("factor")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0) as f32;
+                let roughness = enabled_channel(material, "ClearCoatRoughness")
+                    .and_then(|channel| channel.get("factor"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0) as f32;
+                extensions.insert(
+                    "KHR_materials_clearcoat".to_owned(),
+                    json!({
+                        "clearcoatFactor": factor,
+                        "clearcoatRoughnessFactor": roughness
+                    }),
+                );
+            }
+            if let Some(specular) = enabled_channel(material, "SpecularF0") {
+                extensions.insert(
+                    "KHR_materials_specular".to_owned(),
+                    json!({
+                        "specularFactor": specular
+                            .get("factor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(1.0)
+                    }),
+                );
+            }
             materials.insert(
                 name.to_owned(),
                 MaterialEntry {
@@ -445,11 +604,28 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
                     base_color: [base_rgb[0], base_rgb[1], base_rgb[2], alpha],
                     base_color_texture,
                     emissive_color,
+                    emissive_enabled: emissive.is_some(),
                     emissive_texture,
                     occlusion_texture,
                     normal_texture,
                     metallic_texture,
                     roughness_texture,
+                    roughness_invert: glossiness_channel.is_some() && roughness_channel.is_none(),
+                    opacity_texture,
+                    alpha_mask_texture,
+                    alpha_invert: opacity
+                        .or(alpha_mask)
+                        .and_then(|channel| channel.get("invert"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    normal_scale: normal
+                        .and_then(|channel| channel.get("factor"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0) as f32,
+                    normal_flip_y: normal
+                        .and_then(|channel| channel.get("flipY"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     metallic_factor: metallic
                         .and_then(|v| v.get("factor"))
                         .and_then(Value::as_f64)
@@ -457,12 +633,29 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
                     roughness_factor: roughness
                         .and_then(|v| v.get("factor"))
                         .and_then(Value::as_f64)
+                        .map(|value| {
+                            if glossiness_channel.is_some() && roughness_channel.is_none() {
+                                1.0 - value
+                            } else {
+                                value
+                            }
+                        })
                         .unwrap_or(1.0) as f32,
                     alpha_mode,
                     alpha_cutoff: alpha_mask
                         .and_then(|v| v.get("factor"))
                         .and_then(Value::as_f64)
                         .unwrap_or(0.5) as f32,
+                    double_sided: material
+                        .get("cullFace")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == "DISABLE"),
+                    unlit: global_unlit
+                        || material
+                            .get("shadeless")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    extensions,
                 },
             );
         }
@@ -525,6 +718,7 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
             })
         })
         .collect();
+    let vertex_color = model.pointer("/options/shading/vertexColor");
 
     Ok(ModelConfig {
         work_dir: Path::new(CACHE_DIR).join(uid),
@@ -534,6 +728,19 @@ fn get_model_config(uid: &str) -> Result<ModelConfig> {
         texture_map,
         materials,
         animations,
+        vertex_colors: vertex_color
+            .and_then(|value| value.get("enable"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        vertex_color_alpha: vertex_color
+            .and_then(|value| value.get("useAlpha"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        vertex_color_srgb: vertex_color
+            .and_then(|value| value.get("colorSpace"))
+            .and_then(Value::as_str)
+            == Some("srgb"),
+        flip_uvs: !global_unlit,
     })
 }
 
@@ -1197,6 +1404,117 @@ fn meta_value(meta: &HashMap<String, Value>, key: &str) -> f32 {
     num(meta.get(key)) as f32
 }
 
+fn morph_delta_attribute(
+    target: Vec<f32>,
+    base: &Attribute,
+    item_size: usize,
+    count: usize,
+) -> Option<Attribute> {
+    if base.item_size != item_size || base.count != count {
+        return None;
+    }
+    let base = base.data.to_f32_vec();
+    if target.len() != base.len() {
+        return None;
+    }
+    Some(Attribute {
+        data: AttrData::F32(
+            target
+                .into_iter()
+                .zip(base)
+                .map(|(target, base)| target - base)
+                .collect(),
+        ),
+        item_size,
+        count,
+        component_type: 5126,
+        normalized: false,
+    })
+}
+
+fn decode_morph_target(
+    target: &Value,
+    poly_bin: &[u8],
+    base_attributes: &HashMap<String, Attribute>,
+) -> Result<Option<MorphTarget>> {
+    let name = target
+        .get("Name")
+        .and_then(Value::as_str)
+        .unwrap_or("morph")
+        .to_owned();
+    let metadata = user_data_values(target);
+    let attributes = target.get("VertexAttributeList").and_then(Value::as_object);
+    let Some(attributes) = attributes else {
+        return Ok(None);
+    };
+    let mut output = HashMap::new();
+
+    if let Some(definition) = attributes.get("Vertex") {
+        if let Some((array_type, array_definition)) =
+            definition.get("Array").and_then(first_key_value)
+        {
+            let item_size = definition
+                .get("ItemSize")
+                .and_then(Value::as_u64)
+                .unwrap_or(3) as usize;
+            let count = array_definition
+                .get("Size")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let mut positions =
+                read_buffer_array(poly_bin, array_definition, item_size, array_type)?.to_f32_vec();
+            if metadata.contains_key("vtx_bbl_x") {
+                let mut lower = vec![
+                    meta_value(&metadata, "vtx_bbl_x"),
+                    meta_value(&metadata, "vtx_bbl_y"),
+                ];
+                let mut step = vec![
+                    meta_value(&metadata, "vtx_h_x"),
+                    meta_value(&metadata, "vtx_h_y"),
+                ];
+                if item_size == 3 {
+                    lower.push(meta_value(&metadata, "vtx_bbl_z"));
+                    step.push(meta_value(&metadata, "vtx_h_z"));
+                }
+                positions = dequantize(&positions, &lower, &step, item_size);
+            }
+            if let Some(base) = base_attributes.get("POSITION") {
+                if let Some(attribute) = morph_delta_attribute(positions, base, item_size, count) {
+                    output.insert("POSITION".to_owned(), attribute);
+                }
+            }
+        }
+    }
+
+    if let Some(definition) = attributes.get("Normal") {
+        if let Some((array_type, array_definition)) =
+            definition.get("Array").and_then(first_key_value)
+        {
+            let count = array_definition
+                .get("Size")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let raw = read_buffer_array(poly_bin, array_definition, 2, array_type)?;
+            let normals = decode_normals(
+                &raw.to_f32_vec(),
+                3,
+                meta_value(&metadata, "epsilon").max(0.25),
+                meta_value(&metadata, "nphi").max(720.0),
+            );
+            if let Some(base) = base_attributes.get("NORMAL") {
+                if let Some(attribute) = morph_delta_attribute(normals, base, 3, count) {
+                    output.insert("NORMAL".to_owned(), attribute);
+                }
+            }
+        }
+    }
+
+    Ok((!output.is_empty()).then_some(MorphTarget {
+        name,
+        attributes: output,
+    }))
+}
+
 fn process_geometry(
     geom: &Value,
     poly_bin: &[u8],
@@ -1238,6 +1556,7 @@ fn process_geometry(
 
     let mut strip_indices = None;
     let mut indices = Vec::new();
+    let mut primitive_mode = None;
     let mut expected_state = 0i64;
     if let Some(prims) = geom.get("PrimitiveSetList").and_then(Value::as_array) {
         for prim in prims {
@@ -1250,6 +1569,13 @@ fn process_geometry(
             let Some((arr_type, arr_def)) = first_key_value(arr_info) else {
                 continue;
             };
+            if arr_def
+                .get("File")
+                .and_then(Value::as_str)
+                .is_some_and(|file| file.contains("wireframe"))
+            {
+                continue;
+            }
             let bin = if arr_def
                 .get("File")
                 .and_then(Value::as_str)
@@ -1265,9 +1591,18 @@ fn process_geometry(
             };
             let mode = draw.get("Mode").and_then(Value::as_str);
             let is_strip = mode == Some("TRIANGLE_STRIP");
-            if !is_strip && mode != Some("TRIANGLES") {
+            let output_mode = match mode {
+                Some("POINTS") => 0,
+                Some("LINES") => 1,
+                Some("LINE_LOOP") => 2,
+                Some("LINE_STRIP") => 3,
+                Some("TRIANGLES") | Some("TRIANGLE_STRIP") => 4,
+                _ => continue,
+            };
+            if primitive_mode.is_some_and(|current| current != output_mode) {
                 continue;
             }
+            primitive_mode = Some(output_mode);
             let source_bits = if arr_type == "Uint32Array" { 32 } else { 16 };
             let mut idx: Vec<u32> = read_buffer_array(bin, arr_def, 1, arr_type)?
                 .as_i64_vec()
@@ -1453,7 +1788,7 @@ fn process_geometry(
                     "_SKETCHFAB_COLOR_0".to_owned(),
                     Attribute {
                         data,
-                        item_size: item_size.max(4),
+                        item_size,
                         count,
                         component_type,
                         normalized,
@@ -1465,24 +1800,48 @@ fn process_geometry(
     let mut tc_keys = attributes
         .keys()
         .filter(|k| k.starts_with("_TC_"))
-        .cloned()
+        .filter_map(|key| {
+            key.trim_start_matches("_TC_")
+                .parse::<u32>()
+                .ok()
+                .map(|unit| (unit, key.clone()))
+        })
         .collect::<Vec<_>>();
-    tc_keys.sort();
-    for (i, key) in tc_keys.into_iter().enumerate() {
+    tc_keys.sort_by_key(|(unit, _)| *unit);
+    let mut texcoord_units = HashMap::new();
+    for (i, (unit, key)) in tc_keys.into_iter().enumerate() {
         if let Some(attr) = attributes.remove(&key) {
             attributes.insert(format!("TEXCOORD_{i}"), attr);
+            texcoord_units.insert(unit, i as u32);
         }
     }
     if !attributes.contains_key("POSITION") {
         return Ok(None);
     }
+    let mut morph_targets = Vec::new();
+    if let Some(targets) = geom.get("MorphTargets").and_then(Value::as_array) {
+        for wrapper in targets {
+            let Some((_, target)) = first_key_value(wrapper) else {
+                continue;
+            };
+            match decode_morph_target(target, poly_bin, &attributes) {
+                Ok(Some(target)) => morph_targets.push(target),
+                Ok(None) => {}
+                Err(error) => eprintln!("  Warning: skipping morph target: {error}"),
+            }
+        }
+    }
     Ok(Some(Geometry {
         indices,
+        mode: primitive_mode.unwrap_or(4),
         attributes,
+        morph_targets,
+        texcoord_units,
         material_name,
         joint_names: Vec::new(),
         matrix: matrix16(None),
         skeleton_matrix: None,
+        animation_target: None,
     }))
 }
 
@@ -1646,10 +2005,41 @@ fn multiply_matrices(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     out
 }
 
-fn scene_coordinate_matrix() -> [f32; 16] {
-    [
-        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ]
+fn contains_gltf_scene_root(value: &Value) -> bool {
+    if value
+        .get("osg.MatrixTransform")
+        .and_then(|transform| transform.get("Name"))
+        .and_then(Value::as_str)
+        == Some("GLTF_SceneRootNode")
+    {
+        return true;
+    }
+    match value {
+        Value::Object(object) => object.values().any(contains_gltf_scene_root),
+        Value::Array(array) => array.iter().any(contains_gltf_scene_root),
+        _ => false,
+    }
+}
+
+fn contains_texture_attributes(value: &Value) -> bool {
+    if value.get("TextureAttributeList").is_some() {
+        return true;
+    }
+    match value {
+        Value::Object(object) => object.values().any(contains_texture_attributes),
+        Value::Array(array) => array.iter().any(contains_texture_attributes),
+        _ => false,
+    }
+}
+
+fn scene_coordinate_matrix(scene: &Value) -> [f32; 16] {
+    if contains_gltf_scene_root(scene) {
+        matrix16(None)
+    } else {
+        [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+    }
 }
 
 fn invert_affine_matrix(matrix: &[f32; 16]) -> Option<[f32; 16]> {
@@ -1687,6 +2077,50 @@ fn invert_affine_matrix(matrix: &[f32; 16]) -> Option<[f32; 16]> {
             + inverse[8 + row] * translation[2]);
     }
     Some(inverse)
+}
+
+fn decompose_matrix(matrix: &[f32; 16]) -> ([f32; 3], [f32; 4], [f32; 3]) {
+    let translation = [matrix[12], matrix[13], matrix[14]];
+    let mut scale = [
+        (matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]).sqrt(),
+        (matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]).sqrt(),
+        (matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]).sqrt(),
+    ];
+    for value in &mut scale {
+        if value.abs() < 1e-8 {
+            *value = 1.0;
+        }
+    }
+    let determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[9] * matrix[6])
+        - matrix[4] * (matrix[1] * matrix[10] - matrix[9] * matrix[2])
+        + matrix[8] * (matrix[1] * matrix[6] - matrix[5] * matrix[2]);
+    if determinant < 0.0 {
+        scale[0] = -scale[0];
+    }
+    let m00 = matrix[0] / scale[0];
+    let m01 = matrix[4] / scale[1];
+    let m02 = matrix[8] / scale[2];
+    let m10 = matrix[1] / scale[0];
+    let m11 = matrix[5] / scale[1];
+    let m12 = matrix[9] / scale[2];
+    let m20 = matrix[2] / scale[0];
+    let m21 = matrix[6] / scale[1];
+    let m22 = matrix[10] / scale[2];
+    let trace = m00 + m11 + m22;
+    let rotation = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, s * 0.25]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [s * 0.25, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(m01 + m10) / s, s * 0.25, (m12 + m21) / s, (m02 - m20) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(m02 + m20) / s, (m12 + m21) / s, s * 0.25, (m10 - m01) / s]
+    };
+    (translation, rotation, scale)
 }
 
 fn collect_skeleton_nodes(
@@ -1790,7 +2224,8 @@ fn collect_geometries(
         &root,
         poly_bin,
         wire_bin,
-        &scene_coordinate_matrix(),
+        &scene_coordinate_matrix(&root),
+        None,
         None,
         &mut out,
         &mut seen,
@@ -1880,6 +2315,7 @@ fn traverse_geometries(
     wire_bin: Option<&[u8]>,
     parent_matrix: &[f32; 16],
     skeleton_matrix: Option<[f32; 16]>,
+    animation_target: Option<String>,
     out: &mut Vec<Geometry>,
     seen: &mut HashSet<u64>,
 ) -> Result<()> {
@@ -1891,6 +2327,18 @@ fn traverse_geometries(
             } else {
                 multiply_matrices(parent_matrix, &local)
             };
+        let target = transform
+            .get("UpdateCallbacks")
+            .and_then(Value::as_array)
+            .and_then(|callbacks| {
+                callbacks.iter().find_map(|callback| {
+                    callback
+                        .pointer("/osgAnimation.UpdateMatrixTransform/Name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            })
+            .or(animation_target);
         if let Some(children) = transform.get("Children").and_then(Value::as_array) {
             for child in children {
                 traverse_geometries(
@@ -1899,6 +2347,7 @@ fn traverse_geometries(
                     wire_bin,
                     &combined,
                     skeleton_matrix,
+                    target.clone(),
                     out,
                     seen,
                 )?;
@@ -1915,6 +2364,7 @@ fn traverse_geometries(
                     wire_bin,
                     parent_matrix,
                     Some(*parent_matrix),
+                    animation_target.clone(),
                     out,
                     seen,
                 )?;
@@ -1928,24 +2378,14 @@ fn traverse_geometries(
                 .get("osg.Geometry")
                 .or_else(|| source.get("osgAnimation.MorphGeometry"))
         }) {
-            let is_wire = source
-                .get("PrimitiveSetList")
-                .and_then(Value::as_array)
-                .is_some_and(|prims| {
-                    prims.iter().any(|primitive| {
-                        first_key_value(primitive)
-                            .and_then(|(_, draw)| draw.get("Mode"))
-                            .and_then(Value::as_str)
-                            == Some("LINES")
-                    })
-                });
             let id = source.get("UniqueID").and_then(Value::as_u64);
-            if !is_wire && id.is_none_or(|id| seen.insert(id)) {
+            if id.is_none_or(|id| seen.insert(id)) {
                 match process_geometry(source, poly_bin, wire_bin) {
                     Ok(Some(mut geometry)) => {
                         add_rig_attributes(&mut geometry, rig, poly_bin)?;
                         geometry.matrix = *parent_matrix;
                         geometry.skeleton_matrix = skeleton_matrix;
+                        geometry.animation_target = animation_target.clone();
                         out.push(geometry);
                     }
                     Ok(None) => {}
@@ -1956,31 +2396,19 @@ fn traverse_geometries(
         return Ok(());
     }
     if let Some(geom) = v.get("osg.Geometry") {
-        let is_wire = geom
-            .get("PrimitiveSetList")
-            .and_then(Value::as_array)
-            .is_some_and(|prims| {
-                prims.iter().any(|p| {
-                    first_key_value(p)
-                        .and_then(|(_, d)| d.get("Mode"))
-                        .and_then(Value::as_str)
-                        == Some("LINES")
-                })
-            });
-        if !is_wire {
-            if let Some(id) = geom.get("UniqueID").and_then(Value::as_u64) {
-                if !seen.insert(id) {
-                    return Ok(());
-                }
+        if let Some(id) = geom.get("UniqueID").and_then(Value::as_u64) {
+            if !seen.insert(id) {
+                return Ok(());
             }
-            match process_geometry(geom, poly_bin, wire_bin) {
-                Ok(Some(mut geometry)) => {
-                    geometry.matrix = *parent_matrix;
-                    out.push(geometry);
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("  Warning: skipping geometry: {e}"),
+        }
+        match process_geometry(geom, poly_bin, wire_bin) {
+            Ok(Some(mut geometry)) => {
+                geometry.matrix = *parent_matrix;
+                geometry.animation_target = animation_target.clone();
+                out.push(geometry);
             }
+            Ok(None) => {}
+            Err(e) => eprintln!("  Warning: skipping geometry: {e}"),
         }
     }
     for ptr in [
@@ -1997,6 +2425,7 @@ fn traverse_geometries(
                     wire_bin,
                     parent_matrix,
                     skeleton_matrix,
+                    animation_target.clone(),
                     out,
                     seen,
                 )?;
@@ -2156,7 +2585,7 @@ fn is_environment_geometry(
     extents[2] > 0.0 && extents[0] <= extents[2] * 0.01 && extents[1] >= extents[2] * 0.5
 }
 
-fn add_image_texture(gltf: &mut Value, bin: &mut Vec<u8>, path: &Path) -> Result<Option<usize>> {
+fn add_image(gltf: &mut Value, bin: &mut Vec<u8>, path: &Path) -> Result<Option<usize>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -2170,10 +2599,10 @@ fn add_image_texture(gltf: &mut Value, bin: &mut Vec<u8>, path: &Path) -> Result
     } else {
         "image/jpeg"
     };
-    Ok(Some(add_image_texture_bytes(gltf, bin, &bytes, mime)))
+    Ok(Some(add_image_bytes(gltf, bin, &bytes, mime)))
 }
 
-fn add_image_texture_bytes(gltf: &mut Value, bin: &mut Vec<u8>, bytes: &[u8], mime: &str) -> usize {
+fn add_image_bytes(gltf: &mut Value, bin: &mut Vec<u8>, bytes: &[u8], mime: &str) -> usize {
     let (offset, len) = push_padded(bin, &bytes);
     let bv_idx = gltf["bufferViews"].as_array().unwrap().len();
     gltf["bufferViews"]
@@ -2185,12 +2614,92 @@ fn add_image_texture_bytes(gltf: &mut Value, bin: &mut Vec<u8>, bytes: &[u8], mi
         .as_array_mut()
         .unwrap()
         .push(json!({ "bufferView": bv_idx, "mimeType": mime }));
-    let tex_idx = gltf["textures"].as_array().unwrap().len();
+    image_idx
+}
+
+fn add_sampler(gltf: &mut Value, settings: SamplerSettings) -> usize {
+    let index = gltf["samplers"].as_array().unwrap().len();
+    gltf["samplers"].as_array_mut().unwrap().push(json!({
+        "magFilter": settings.mag_filter,
+        "minFilter": settings.min_filter,
+        "wrapS": settings.wrap_s,
+        "wrapT": settings.wrap_t
+    }));
+    index
+}
+
+fn add_texture(gltf: &mut Value, image: usize, sampler: usize) -> usize {
+    let index = gltf["textures"].as_array().unwrap().len();
     gltf["textures"]
         .as_array_mut()
         .unwrap()
-        .push(json!({ "source": image_idx, "sampler": 0 }));
-    tex_idx
+        .push(json!({ "source": image, "sampler": sampler }));
+    index
+}
+
+fn texture_info(
+    usage: &TextureUse,
+    texture_indices: &HashMap<(String, SamplerSettings), usize>,
+    texcoord_units: &HashMap<u32, u32>,
+    uses_texture_transform: &mut bool,
+    uvs_flipped: bool,
+) -> Option<Value> {
+    let index = texture_indices
+        .get(&(usage.uid.clone(), usage.sampler))
+        .copied()?;
+    Some(texture_info_for_index(
+        index,
+        usage,
+        texcoord_units,
+        uses_texture_transform,
+        uvs_flipped,
+    ))
+}
+
+fn texture_info_for_index(
+    index: usize,
+    usage: &TextureUse,
+    texcoord_units: &HashMap<u32, u32>,
+    uses_texture_transform: &mut bool,
+    uvs_flipped: bool,
+) -> Value {
+    let texcoord = texcoord_units
+        .get(&usage.texcoord_unit)
+        .copied()
+        .or_else(|| texcoord_units.values().copied().min())
+        .unwrap_or(0);
+    let transform = &usage.transform;
+    let (rotation, offset) = if uvs_flipped {
+        let sin = transform.rotation.sin();
+        let cos = transform.rotation.cos();
+        (
+            -transform.rotation,
+            [
+                transform.offset[0] - sin * transform.scale[1],
+                1.0 - transform.offset[1] - cos * transform.scale[1],
+            ],
+        )
+    } else {
+        (transform.rotation, transform.offset)
+    };
+    let changed = offset[0].abs() > 1e-6
+        || offset[1].abs() > 1e-6
+        || (transform.scale[0] - 1.0).abs() > 1e-6
+        || (transform.scale[1] - 1.0).abs() > 1e-6
+        || rotation.abs() > 1e-6;
+    let mut info = json!({ "index": index, "texCoord": texcoord });
+    if changed {
+        *uses_texture_transform = true;
+        let mut extension = json!({
+            "offset": offset,
+            "scale": transform.scale
+        });
+        if rotation.abs() > 1e-6 {
+            extension["rotation"] = json!(rotation);
+        }
+        info["extensions"] = json!({ "KHR_texture_transform": extension });
+    }
+    info
 }
 
 fn texture_file<'a>(texture: &'a TextureEntry, texture_dir: &Path) -> PathBuf {
@@ -2203,6 +2712,7 @@ fn add_metallic_roughness_texture(
     texture_dir: &Path,
     metallic: Option<&TextureEntry>,
     roughness: Option<&TextureEntry>,
+    invert_roughness: bool,
 ) -> Result<Option<usize>> {
     let load = |texture: Option<&TextureEntry>| -> Result<Option<image::GrayImage>> {
         let Some(texture) = texture else {
@@ -2244,16 +2754,359 @@ fn add_metallic_roughness_texture(
         let rough = roughness
             .as_ref()
             .map_or(255, |image| image.get_pixel(x, y)[0]);
-        Rgba([255, rough, metal, 255])
+        Rgba([
+            255,
+            if invert_roughness { 255 - rough } else { rough },
+            metal,
+            255,
+        ])
     });
     let mut bytes = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(packed).write_to(&mut bytes, ImageFormat::Png)?;
-    Ok(Some(add_image_texture_bytes(
+    Ok(Some(add_image_bytes(
         gltf,
         bin,
         bytes.get_ref(),
         "image/png",
     )))
+}
+
+fn same_texture_mapping(left: &TextureUse, right: &TextureUse) -> bool {
+    left.texcoord_unit == right.texcoord_unit
+        && left.transform.offset == right.transform.offset
+        && left.transform.scale == right.transform.scale
+        && left.transform.rotation == right.transform.rotation
+}
+
+fn add_base_alpha_texture(
+    gltf: &mut Value,
+    bin: &mut Vec<u8>,
+    texture_dir: &Path,
+    base: Option<&TextureEntry>,
+    alpha: &TextureEntry,
+    invert: bool,
+    alpha_channel: bool,
+) -> Result<Option<usize>> {
+    let alpha_path = texture_file(alpha, texture_dir);
+    if !alpha_path.exists() {
+        return Ok(None);
+    }
+    let alpha_image = image::open(alpha_path)?;
+    let alpha = if alpha_channel && alpha_image.color().has_alpha() {
+        let rgba = alpha_image.to_rgba8();
+        ImageBuffer::from_fn(rgba.width(), rgba.height(), |x, y| {
+            image::Luma([rgba.get_pixel(x, y)[3]])
+        })
+    } else {
+        alpha_image.to_luma8()
+    };
+    let mut packed = base
+        .map(|texture| texture_file(texture, texture_dir))
+        .filter(|path| path.exists())
+        .map(image::open)
+        .transpose()?
+        .map(|image| image.to_rgba8())
+        .unwrap_or_else(|| {
+            ImageBuffer::from_pixel(alpha.width(), alpha.height(), Rgba([255, 255, 255, 255]))
+        });
+    let (width, height) = packed.dimensions();
+    let alpha = if alpha.dimensions() == (width, height) {
+        alpha
+    } else {
+        image::imageops::resize(&alpha, width, height, FilterType::Triangle)
+    };
+    for (pixel, alpha) in packed.pixels_mut().zip(alpha.pixels()) {
+        let alpha = if invert { 255 - alpha[0] } else { alpha[0] };
+        pixel[3] = ((pixel[3] as u16 * alpha as u16) / 255) as u8;
+    }
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(packed).write_to(&mut bytes, ImageFormat::Png)?;
+    Ok(Some(add_image_bytes(
+        gltf,
+        bin,
+        bytes.get_ref(),
+        "image/png",
+    )))
+}
+
+fn add_flipped_normal_texture(
+    gltf: &mut Value,
+    bin: &mut Vec<u8>,
+    texture_dir: &Path,
+    texture: &TextureEntry,
+) -> Result<Option<usize>> {
+    let path = texture_file(texture, texture_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut image = image::open(path)?.to_rgba8();
+    for pixel in image.pixels_mut() {
+        pixel[1] = 255 - pixel[1];
+    }
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image).write_to(&mut bytes, ImageFormat::Png)?;
+    Ok(Some(add_image_bytes(
+        gltf,
+        bin,
+        bytes.get_ref(),
+        "image/png",
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_material_variant(
+    source: &MaterialEntry,
+    texcoord_units: &HashMap<u32, u32>,
+    texture_indices: &HashMap<(String, SamplerSettings), usize>,
+    texture_files: &HashMap<String, TextureEntry>,
+    texture_dir: &Path,
+    sampler_indices: &mut HashMap<SamplerSettings, usize>,
+    packed_indices: &mut HashMap<(Option<String>, Option<String>, bool, SamplerSettings), usize>,
+    alpha_indices: &mut HashMap<(Option<String>, String, bool, bool, SamplerSettings), usize>,
+    normal_indices: &mut HashMap<(String, bool, SamplerSettings), usize>,
+    uses_texture_transform: &mut bool,
+    uvs_flipped: bool,
+    uses_unlit: &mut bool,
+    used_material_extensions: &mut HashSet<String>,
+    gltf: &mut Value,
+    bin: &mut Vec<u8>,
+) -> Result<usize> {
+    let mut material = json!({
+        "name": source.name,
+        "doubleSided": source.double_sided,
+        "alphaMode": source.alpha_mode,
+        "pbrMetallicRoughness": {
+            "baseColorFactor": source.base_color,
+            "metallicFactor": source.metallic_factor,
+            "roughnessFactor": source.roughness_factor
+        }
+    });
+    let alpha_usage = source
+        .alpha_mask_texture
+        .as_ref()
+        .or(source.opacity_texture.as_ref());
+    let combined_base = alpha_usage
+        .filter(|alpha| {
+            source
+                .base_color_texture
+                .as_ref()
+                .is_none_or(|base| same_texture_mapping(base, alpha))
+        })
+        .and_then(|alpha| {
+            let base_uid = source
+                .base_color_texture
+                .as_ref()
+                .map(|base| base.uid.clone());
+            let sampler = source
+                .base_color_texture
+                .as_ref()
+                .map_or(alpha.sampler, |base| base.sampler);
+            let key = (
+                base_uid.clone(),
+                alpha.uid.clone(),
+                source.alpha_invert,
+                alpha.alpha_channel,
+                sampler,
+            );
+            if let Some(index) = alpha_indices.get(&key) {
+                return Some((*index, sampler));
+            }
+            let image = add_base_alpha_texture(
+                gltf,
+                bin,
+                texture_dir,
+                base_uid.as_ref().and_then(|uid| texture_files.get(uid)),
+                texture_files.get(&alpha.uid)?,
+                source.alpha_invert,
+                alpha.alpha_channel,
+            )
+            .ok()
+            .flatten()?;
+            let sampler_index = *sampler_indices
+                .entry(sampler)
+                .or_insert_with(|| add_sampler(gltf, sampler));
+            let index = add_texture(gltf, image, sampler_index);
+            alpha_indices.insert(key, index);
+            Some((index, sampler))
+        });
+    let base_info = if let Some((index, sampler)) = combined_base {
+        let usage = source.base_color_texture.as_ref().or(alpha_usage).unwrap();
+        let mut usage = usage.clone();
+        usage.sampler = sampler;
+        Some(texture_info_for_index(
+            index,
+            &usage,
+            texcoord_units,
+            uses_texture_transform,
+            uvs_flipped,
+        ))
+    } else {
+        source.base_color_texture.as_ref().and_then(|usage| {
+            texture_info(
+                usage,
+                texture_indices,
+                texcoord_units,
+                uses_texture_transform,
+                uvs_flipped,
+            )
+        })
+    };
+    if let Some(info) = base_info {
+        material["pbrMetallicRoughness"]["baseColorTexture"] = info;
+    }
+    if source.emissive_enabled {
+        let strength = source.emissive_color.iter().copied().fold(1.0f32, f32::max);
+        material["emissiveFactor"] = json!([
+            source.emissive_color[0] / strength,
+            source.emissive_color[1] / strength,
+            source.emissive_color[2] / strength
+        ]);
+        if strength > 1.0 {
+            material["extensions"]["KHR_materials_emissive_strength"] =
+                json!({ "emissiveStrength": strength });
+            used_material_extensions.insert("KHR_materials_emissive_strength".to_owned());
+        }
+    }
+    if let Some(info) = source.emissive_texture.as_ref().and_then(|usage| {
+        texture_info(
+            usage,
+            texture_indices,
+            texcoord_units,
+            uses_texture_transform,
+            uvs_flipped,
+        )
+    }) {
+        material["emissiveTexture"] = info;
+    }
+    if let Some(mut info) = source.occlusion_texture.as_ref().and_then(|usage| {
+        texture_info(
+            usage,
+            texture_indices,
+            texcoord_units,
+            uses_texture_transform,
+            uvs_flipped,
+        )
+    }) {
+        info["strength"] = json!(1.0);
+        material["occlusionTexture"] = info;
+    }
+    let normal_info = if source.normal_flip_y {
+        source.normal_texture.as_ref().and_then(|usage| {
+            let key = (usage.uid.clone(), true, usage.sampler);
+            let index = if let Some(index) = normal_indices.get(&key) {
+                Some(*index)
+            } else {
+                let image = add_flipped_normal_texture(
+                    gltf,
+                    bin,
+                    texture_dir,
+                    texture_files.get(&usage.uid)?,
+                )
+                .ok()
+                .flatten()?;
+                let sampler = *sampler_indices
+                    .entry(usage.sampler)
+                    .or_insert_with(|| add_sampler(gltf, usage.sampler));
+                let index = add_texture(gltf, image, sampler);
+                normal_indices.insert(key, index);
+                Some(index)
+            }?;
+            Some(texture_info_for_index(
+                index,
+                usage,
+                texcoord_units,
+                uses_texture_transform,
+                uvs_flipped,
+            ))
+        })
+    } else {
+        source.normal_texture.as_ref().and_then(|usage| {
+            texture_info(
+                usage,
+                texture_indices,
+                texcoord_units,
+                uses_texture_transform,
+                uvs_flipped,
+            )
+        })
+    };
+    if let Some(mut info) = normal_info {
+        info["scale"] = json!(source.normal_scale);
+        material["normalTexture"] = info;
+    }
+    if source.metallic_texture.is_some() || source.roughness_texture.is_some() {
+        let usage = source
+            .roughness_texture
+            .as_ref()
+            .or(source.metallic_texture.as_ref())
+            .unwrap();
+        let key = (
+            source
+                .metallic_texture
+                .as_ref()
+                .map(|texture| texture.uid.clone()),
+            source
+                .roughness_texture
+                .as_ref()
+                .map(|texture| texture.uid.clone()),
+            source.roughness_invert,
+            usage.sampler,
+        );
+        let packed_index = if let Some(index) = packed_indices.get(&key) {
+            Some(*index)
+        } else {
+            let image = add_metallic_roughness_texture(
+                gltf,
+                bin,
+                texture_dir,
+                source
+                    .metallic_texture
+                    .as_ref()
+                    .and_then(|texture| texture_files.get(&texture.uid)),
+                source
+                    .roughness_texture
+                    .as_ref()
+                    .and_then(|texture| texture_files.get(&texture.uid)),
+                source.roughness_invert,
+            )?;
+            image.map(|image| {
+                let sampler = *sampler_indices
+                    .entry(usage.sampler)
+                    .or_insert_with(|| add_sampler(gltf, usage.sampler));
+                let index = add_texture(gltf, image, sampler);
+                packed_indices.insert(key, index);
+                index
+            })
+        };
+        if let Some(index) = packed_index {
+            material["pbrMetallicRoughness"]["metallicRoughnessTexture"] = texture_info_for_index(
+                index,
+                usage,
+                texcoord_units,
+                uses_texture_transform,
+                uvs_flipped,
+            );
+        }
+    }
+    if source.alpha_mode == "MASK" {
+        material["alphaCutoff"] = json!(source.alpha_cutoff);
+    }
+    if !source.unlit && !source.extensions.is_empty() {
+        for (name, extension) in &source.extensions {
+            material["extensions"][name] = extension.clone();
+            used_material_extensions.insert(name.clone());
+        }
+    }
+    if source.unlit {
+        *uses_unlit = true;
+        if material.get("extensions").is_none() {
+            material["extensions"] = json!({});
+        }
+        material["extensions"]["KHR_materials_unlit"] = json!({});
+    }
+    let index = gltf["materials"].as_array().unwrap().len();
+    gltf["materials"].as_array_mut().unwrap().push(material);
+    Ok(index)
 }
 
 fn user_data_values(value: &Value) -> HashMap<String, Value> {
@@ -2360,6 +3213,54 @@ fn make_quaternions_continuous(values: &mut [f32]) {
     }
 }
 
+fn deduplicate_keyframes(
+    times: Vec<f32>,
+    values: Vec<f32>,
+    components: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    if components == 0 || values.len() / components != times.len() {
+        return (times, values);
+    }
+    let mut filtered_times = Vec::with_capacity(times.len());
+    let mut filtered_values = Vec::with_capacity(values.len());
+    for (index, time) in times.into_iter().enumerate() {
+        if filtered_times.last().is_none_or(|last| time > *last) {
+            filtered_times.push(time);
+            filtered_values
+                .extend_from_slice(&values[index * components..(index + 1) * components]);
+        } else if filtered_times.last() == Some(&time) {
+            let start = filtered_values.len() - components;
+            filtered_values[start..]
+                .copy_from_slice(&values[index * components..(index + 1) * components]);
+        }
+    }
+    (filtered_times, filtered_values)
+}
+
+fn sample_scalar_track(track: &ScalarTrack, time: f32) -> f32 {
+    if track.times.is_empty() {
+        return 0.0;
+    }
+    match track
+        .times
+        .binary_search_by(|candidate| candidate.total_cmp(&time))
+    {
+        Ok(index) => track.values[index],
+        Err(0) => track.values[0],
+        Err(index) if index >= track.times.len() => *track.values.last().unwrap_or(&0.0),
+        Err(index) => {
+            let previous = index - 1;
+            let span = track.times[index] - track.times[previous];
+            if span <= f32::EPSILON {
+                track.values[index]
+            } else {
+                let amount = (time - track.times[previous]) / span;
+                track.values[previous] + (track.values[index] - track.values[previous]) * amount
+            }
+        }
+    }
+}
+
 fn decode_animation_array(
     animation_bin: &[u8],
     definition: &Value,
@@ -2446,11 +3347,13 @@ fn export_animation(
     animation: &Value,
     animation_bin: &[u8],
     node_by_name: &HashMap<String, usize>,
+    morph_bindings: &HashMap<String, Vec<MorphTargetBinding>>,
     gltf: &mut Value,
     bin: &mut Vec<u8>,
 ) -> Result<usize> {
     let mut samplers = Vec::new();
     let mut channels = Vec::new();
+    let mut morph_groups: HashMap<usize, (usize, Vec<Option<ScalarTrack>>)> = HashMap::new();
     let Some(source_channels) = animation.get("Channels").and_then(Value::as_array) else {
         return Ok(0);
     };
@@ -2461,14 +3364,54 @@ fn export_animation(
         let Some(target_name) = channel.get("TargetName").and_then(Value::as_str) else {
             continue;
         };
+        let Some(channel_name) = channel.get("Name").and_then(Value::as_str) else {
+            continue;
+        };
+        if channel_type.contains("Float") {
+            let Some(bindings) = morph_bindings.get(target_name) else {
+                continue;
+            };
+            let metadata = user_data_values(channel);
+            let compressed = channel_type.contains("Compressed");
+            let Some(key_frames) = channel.get("KeyFrames") else {
+                continue;
+            };
+            let times = decode_animation_array(
+                animation_bin,
+                &key_frames["Time"],
+                &metadata,
+                compressed,
+                false,
+                1,
+            )?;
+            let values = decode_animation_array(
+                animation_bin,
+                &key_frames["Key"],
+                &metadata,
+                compressed,
+                channel_type.contains("Packed"),
+                1,
+            )?;
+            let (times, values) = deduplicate_keyframes(times, values, 1);
+            if times.is_empty() || values.len() != times.len() {
+                continue;
+            }
+            let track = ScalarTrack { times, values };
+            for binding in bindings {
+                let group = morph_groups
+                    .entry(binding.node)
+                    .or_insert_with(|| (binding.target_count, vec![None; binding.target_count]));
+                if group.0 == binding.target_count && binding.target_index < group.1.len() {
+                    group.1[binding.target_index] = Some(track.clone());
+                }
+            }
+            continue;
+        }
         let Some(node) = node_by_name
             .get(target_name)
             .or_else(|| node_by_name.get(without_numeric_suffix(target_name)))
             .copied()
         else {
-            continue;
-        };
-        let Some(channel_name) = channel.get("Name").and_then(Value::as_str) else {
             continue;
         };
         let (path, components) = match channel_name {
@@ -2499,23 +3442,7 @@ fn export_animation(
             packed,
             components,
         )?;
-        if values.len() / components == times.len() {
-            let mut filtered_times = Vec::with_capacity(times.len());
-            let mut filtered_values = Vec::with_capacity(values.len());
-            for (index, time) in times.iter().copied().enumerate() {
-                if filtered_times.last().is_none_or(|last| time > *last) {
-                    filtered_times.push(time);
-                    filtered_values
-                        .extend_from_slice(&values[index * components..(index + 1) * components]);
-                } else if filtered_times.last() == Some(&time) {
-                    let start = filtered_values.len() - components;
-                    filtered_values[start..]
-                        .copy_from_slice(&values[index * components..(index + 1) * components]);
-                }
-            }
-            times = filtered_times;
-            values = filtered_values;
-        }
+        (times, values) = deduplicate_keyframes(times, values, components);
         if path == "rotation" {
             make_quaternions_continuous(&mut values);
         }
@@ -2558,6 +3485,65 @@ fn export_animation(
             }
         }));
     }
+    let mut morph_nodes = morph_groups.into_iter().collect::<Vec<_>>();
+    morph_nodes.sort_by_key(|(node, _)| *node);
+    for (node, (target_count, tracks)) in morph_nodes {
+        let mut times = tracks
+            .iter()
+            .flatten()
+            .flat_map(|track| track.times.iter().copied())
+            .collect::<Vec<_>>();
+        times.sort_by(f32::total_cmp);
+        times.dedup();
+        if times.is_empty() {
+            continue;
+        }
+        let mut weights = Vec::with_capacity(times.len() * target_count);
+        for time in &times {
+            for track in &tracks {
+                weights.push(
+                    track
+                        .as_ref()
+                        .map_or(0.0, |track| sample_scalar_track(track, *time)),
+                );
+            }
+        }
+        let input = add_accessor(
+            gltf,
+            bin,
+            &Attribute {
+                data: AttrData::F32(times.clone()),
+                item_size: 1,
+                count: times.len(),
+                component_type: 5126,
+                normalized: false,
+            },
+        )?;
+        let output = add_accessor(
+            gltf,
+            bin,
+            &Attribute {
+                data: AttrData::F32(weights),
+                item_size: 1,
+                count: times.len() * target_count,
+                component_type: 5126,
+                normalized: false,
+            },
+        )?;
+        let sampler = samplers.len();
+        samplers.push(json!({
+            "input": input,
+            "output": output,
+            "interpolation": "LINEAR"
+        }));
+        channels.push(json!({
+            "sampler": sampler,
+            "target": {
+                "node": node,
+                "path": "weights"
+            }
+        }));
+    }
     if channels.is_empty() {
         return Ok(0);
     }
@@ -2576,6 +3562,7 @@ fn export_animations_from_scene(
     value: &Value,
     animation_bins: &HashMap<String, Vec<u8>>,
     node_by_name: &HashMap<String, usize>,
+    morph_bindings: &HashMap<String, Vec<MorphTargetBinding>>,
     gltf: &mut Value,
     bin: &mut Vec<u8>,
 ) -> Result<usize> {
@@ -2594,20 +3581,39 @@ fn export_animations_from_scene(
             println!("  Skipping animation {name}: binary not available");
             return Ok(0);
         };
-        return export_animation(animation, animation_bin, node_by_name, gltf, bin);
+        return export_animation(
+            animation,
+            animation_bin,
+            node_by_name,
+            morph_bindings,
+            gltf,
+            bin,
+        );
     }
     let mut count = 0;
     match value {
         Value::Object(object) => {
             for child in object.values() {
-                count +=
-                    export_animations_from_scene(child, animation_bins, node_by_name, gltf, bin)?;
+                count += export_animations_from_scene(
+                    child,
+                    animation_bins,
+                    node_by_name,
+                    morph_bindings,
+                    gltf,
+                    bin,
+                )?;
             }
         }
         Value::Array(array) => {
             for child in array {
-                count +=
-                    export_animations_from_scene(child, animation_bins, node_by_name, gltf, bin)?;
+                count += export_animations_from_scene(
+                    child,
+                    animation_bins,
+                    node_by_name,
+                    morph_bindings,
+                    gltf,
+                    bin,
+                )?;
             }
         }
         _ => {}
@@ -2629,6 +3635,61 @@ fn is_black_line_material(name: &str, material: Option<&MaterialEntry>) -> bool 
         })
 }
 
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn configure_vertex_colors(geometry: &mut Geometry, enabled: bool, use_alpha: bool, srgb: bool) {
+    let Some(source) = geometry.attributes.remove("_SKETCHFAB_COLOR_0") else {
+        return;
+    };
+    if !enabled || source.item_size < 3 {
+        return;
+    }
+    let divisor = if source.normalized {
+        match source.component_type {
+            5121 => 255.0,
+            5123 => 65535.0,
+            _ => 1.0,
+        }
+    } else {
+        1.0
+    };
+    let output_size = if use_alpha && source.item_size >= 4 {
+        4
+    } else {
+        3
+    };
+    let source_values = source.data.to_f32_vec();
+    let mut values = Vec::with_capacity(source.count * output_size);
+    for color in source_values
+        .chunks_exact(source.item_size)
+        .take(source.count)
+    {
+        for value in color.iter().take(3) {
+            let value = *value / divisor;
+            values.push(if srgb { srgb_to_linear(value) } else { value });
+        }
+        if output_size == 4 {
+            values.push(color[3] / divisor);
+        }
+    }
+    geometry.attributes.insert(
+        "COLOR_0".to_owned(),
+        Attribute {
+            data: AttrData::F32(values),
+            item_size: output_size,
+            count: source.count,
+            component_type: 5126,
+            normalized: false,
+        },
+    );
+}
+
 fn convert_to_glb(
     osgjs: &Value,
     poly_bin: &[u8],
@@ -2637,9 +3698,41 @@ fn convert_to_glb(
     source_materials: &HashMap<String, MaterialEntry>,
     animation_bins: &HashMap<String, Vec<u8>>,
     work_dir: &Path,
+    vertex_colors: bool,
+    vertex_color_alpha: bool,
+    vertex_color_srgb: bool,
+    flip_uvs: bool,
 ) -> Result<Vec<u8>> {
     println!("[5/6] Converting to glTF...");
+    let flip_uvs = flip_uvs || contains_texture_attributes(osgjs);
     let mut geometries = collect_geometries(osgjs, poly_bin, wire_bin)?;
+    let animated_geometry_count = geometries
+        .iter()
+        .filter(|geometry| geometry.animation_target.is_some())
+        .count();
+    if animated_geometry_count > 0 {
+        println!("  {animated_geometry_count} animated geometry nodes found");
+    }
+    for geometry in &mut geometries {
+        configure_vertex_colors(
+            geometry,
+            vertex_colors,
+            vertex_color_alpha,
+            vertex_color_srgb,
+        );
+        if !flip_uvs {
+            for (name, attribute) in &mut geometry.attributes {
+                if !name.starts_with("TEXCOORD_") {
+                    continue;
+                }
+                if let AttrData::F32(values) = &mut attribute.data {
+                    for uv in values.chunks_exact_mut(attribute.item_size) {
+                        uv[1] = 1.0 - uv[1];
+                    }
+                }
+            }
+        }
+    }
     geometries.retain(|geometry| {
         if is_environment_geometry(geometry, source_materials) {
             return false;
@@ -2661,7 +3754,7 @@ fn convert_to_glb(
     let mut inverse_bind_by_name = HashMap::new();
     collect_skeleton_nodes(
         &resolved,
-        &scene_coordinate_matrix(),
+        &scene_coordinate_matrix(&resolved),
         &mut nodes,
         &mut scene_roots,
         &mut node_by_name,
@@ -2682,104 +3775,47 @@ fn convert_to_glb(
         "materials": [],
         "textures": [],
         "images": [],
-        "samplers": [{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]
+        "samplers": []
     });
     let mut bin = Vec::new();
     let tex_dir = work_dir.join("textures");
-    let mut texture_indices = HashMap::new();
+    let mut image_indices = HashMap::new();
     let mut texture_uids = texture_files.keys().cloned().collect::<Vec<_>>();
     texture_uids.sort();
     for uid in texture_uids {
         let tex = &texture_files[&uid];
-        if let Some(idx) = add_image_texture(&mut gltf, &mut bin, &texture_file(tex, &tex_dir))? {
-            texture_indices.insert(uid, idx);
+        if let Some(index) = add_image(&mut gltf, &mut bin, &texture_file(tex, &tex_dir))? {
+            image_indices.insert(uid, index);
         }
     }
-
-    let mut material_indices = HashMap::new();
-    let mut metallic_roughness_indices = HashMap::new();
-    let mut material_names = source_materials.keys().cloned().collect::<Vec<_>>();
-    material_names.sort();
-    for name in material_names {
-        let source = &source_materials[&name];
-        let mut material = json!({
-            "name": source.name,
-            "doubleSided": source.name != "OH_Outline_Material",
-            "alphaMode": source.alpha_mode,
-            "pbrMetallicRoughness": {
-                "baseColorFactor": source.base_color,
-                "metallicFactor": source.metallic_factor,
-                "roughnessFactor": source.roughness_factor
+    let mut sampler_indices = HashMap::new();
+    let mut texture_indices = HashMap::new();
+    for material in source_materials.values() {
+        for usage in [
+            material.base_color_texture.as_ref(),
+            material.emissive_texture.as_ref(),
+            material.occlusion_texture.as_ref(),
+            material.normal_texture.as_ref(),
+            material.metallic_texture.as_ref(),
+            material.roughness_texture.as_ref(),
+            material.opacity_texture.as_ref(),
+            material.alpha_mask_texture.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let key = (usage.uid.clone(), usage.sampler);
+            if texture_indices.contains_key(&key) {
+                continue;
             }
-        });
-        if let Some(index) = source
-            .base_color_texture
-            .as_ref()
-            .and_then(|uid| texture_indices.get(uid))
-        {
-            material["pbrMetallicRoughness"]["baseColorTexture"] =
-                json!({ "index": index, "texCoord": 0 });
-        }
-        if let Some(index) = source
-            .emissive_texture
-            .as_ref()
-            .and_then(|uid| texture_indices.get(uid))
-        {
-            material["emissiveTexture"] = json!({ "index": index, "texCoord": 0 });
-            material["emissiveFactor"] = json!(source.emissive_color);
-        }
-        if let Some(index) = source
-            .occlusion_texture
-            .as_ref()
-            .and_then(|uid| texture_indices.get(uid))
-        {
-            material["occlusionTexture"] =
-                json!({ "index": index, "texCoord": 0, "strength": 1.0 });
-        }
-        if let Some(index) = source
-            .normal_texture
-            .as_ref()
-            .and_then(|uid| texture_indices.get(uid))
-        {
-            material["normalTexture"] = json!({ "index": index, "texCoord": 0 });
-        }
-        if source.metallic_texture.is_some() || source.roughness_texture.is_some() {
-            let key = (
-                source.metallic_texture.clone(),
-                source.roughness_texture.clone(),
-            );
-            let packed_index = if let Some(index) = metallic_roughness_indices.get(&key) {
-                Some(*index)
-            } else {
-                let index = add_metallic_roughness_texture(
-                    &mut gltf,
-                    &mut bin,
-                    &tex_dir,
-                    source
-                        .metallic_texture
-                        .as_ref()
-                        .and_then(|uid| texture_files.get(uid)),
-                    source
-                        .roughness_texture
-                        .as_ref()
-                        .and_then(|uid| texture_files.get(uid)),
-                )?;
-                if let Some(index) = index {
-                    metallic_roughness_indices.insert(key, index);
-                }
-                index
+            let Some(image) = image_indices.get(&usage.uid).copied() else {
+                continue;
             };
-            if let Some(index) = packed_index {
-                material["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
-                    json!({ "index": index, "texCoord": 0 });
-            }
+            let sampler = *sampler_indices
+                .entry(usage.sampler)
+                .or_insert_with(|| add_sampler(&mut gltf, usage.sampler));
+            texture_indices.insert(key, add_texture(&mut gltf, image, sampler));
         }
-        if source.alpha_mode == "MASK" {
-            material["alphaCutoff"] = json!(source.alpha_cutoff);
-        }
-        let index = gltf["materials"].as_array().unwrap().len();
-        gltf["materials"].as_array_mut().unwrap().push(material);
-        material_indices.insert(name, index);
     }
     let fallback_material = gltf["materials"].as_array().unwrap().len();
     gltf["materials"].as_array_mut().unwrap().push(json!({
@@ -2792,7 +3828,53 @@ fn convert_to_glb(
         }
     }));
 
+    let mut material_indices: HashMap<(String, Vec<(u32, u32)>), usize> = HashMap::new();
+    let mut metallic_roughness_indices = HashMap::new();
+    let mut alpha_texture_indices = HashMap::new();
+    let mut normal_texture_indices = HashMap::new();
+    let mut uses_texture_transform = false;
+    let mut uses_unlit = false;
+    let mut used_material_extensions = HashSet::new();
+    let mut morph_bindings: HashMap<String, Vec<MorphTargetBinding>> = HashMap::new();
     for geom in geometries {
+        let material_index = if let Some(name) = geom.material_name.as_ref() {
+            if let Some(source) = source_materials.get(name) {
+                let mut units = geom
+                    .texcoord_units
+                    .iter()
+                    .map(|(source, output)| (*source, *output))
+                    .collect::<Vec<_>>();
+                units.sort_unstable();
+                let key = (name.clone(), units);
+                if let Some(index) = material_indices.get(&key) {
+                    *index
+                } else {
+                    let index = add_material_variant(
+                        source,
+                        &geom.texcoord_units,
+                        &texture_indices,
+                        texture_files,
+                        &tex_dir,
+                        &mut sampler_indices,
+                        &mut metallic_roughness_indices,
+                        &mut alpha_texture_indices,
+                        &mut normal_texture_indices,
+                        &mut uses_texture_transform,
+                        flip_uvs,
+                        &mut uses_unlit,
+                        &mut used_material_extensions,
+                        &mut gltf,
+                        &mut bin,
+                    )?;
+                    material_indices.insert(key, index);
+                    index
+                }
+            } else {
+                fallback_material
+            }
+        } else {
+            fallback_material
+        };
         let idx_attr = Attribute {
             data: AttrData::U32(geom.indices.clone()),
             item_size: 1,
@@ -2808,23 +3890,44 @@ fn convert_to_glb(
             set_accessor_target(&mut gltf, accessor, 34962);
             attrs.insert(name.clone(), json!(accessor));
         }
+        let mut targets = Vec::new();
+        for target in &geom.morph_targets {
+            let mut target_attributes = Map::new();
+            for (name, attribute) in &target.attributes {
+                let accessor = add_accessor(&mut gltf, &mut bin, attribute)?;
+                set_accessor_target(&mut gltf, accessor, 34962);
+                target_attributes.insert(name.clone(), json!(accessor));
+            }
+            targets.push(Value::Object(target_attributes));
+        }
         let mesh_index = gltf["meshes"].as_array().unwrap().len();
-        gltf["meshes"].as_array_mut().unwrap().push(json!({
+        let mut primitive = json!({
+            "attributes": attrs,
+            "indices": indices,
+            "material": material_index,
+            "mode": geom.mode
+        });
+        if !targets.is_empty() {
+            primitive["targets"] = json!(targets);
+        }
+        let mut mesh = json!({
             "name": geom
                 .material_name
                 .as_deref()
                 .unwrap_or("mesh"),
-            "primitives": [{
-                "attributes": attrs,
-                "indices": indices,
-                "material": geom
-                    .material_name
-                    .as_ref()
-                    .and_then(|name| material_indices.get(name))
-                    .copied()
-                    .unwrap_or(fallback_material)
-            }]
-        }));
+            "primitives": [primitive]
+        });
+        if !geom.morph_targets.is_empty() {
+            mesh["weights"] = json!(vec![0.0; geom.morph_targets.len()]);
+            mesh["extras"] = json!({
+                "targetNames": geom
+                    .morph_targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect::<Vec<_>>()
+            });
+        }
+        gltf["meshes"].as_array_mut().unwrap().push(mesh);
         let mut mesh_node = json!({
             "name": format!("mesh_{mesh_index}"),
             "mesh": mesh_index
@@ -2863,9 +3966,27 @@ fn convert_to_glb(
             }
         }
         let node_index = nodes.len();
+        for (target_index, target) in geom.morph_targets.iter().enumerate() {
+            morph_bindings
+                .entry(target.name.clone())
+                .or_default()
+                .push(MorphTargetBinding {
+                    node: node_index,
+                    target_index,
+                    target_count: geom.morph_targets.len(),
+                });
+        }
         let is_skinned = mesh_node.get("skin").is_some();
         if !is_skinned {
-            mesh_node["matrix"] = json!(geom.matrix);
+            if let Some(target) = &geom.animation_target {
+                let (translation, rotation, scale) = decompose_matrix(&geom.matrix);
+                mesh_node["translation"] = json!(translation);
+                mesh_node["rotation"] = json!(rotation);
+                mesh_node["scale"] = json!(scale);
+                node_by_name.insert(target.clone(), node_index);
+            } else {
+                mesh_node["matrix"] = json!(geom.matrix);
+            }
         }
         nodes.push(mesh_node);
         scene_roots.push(node_index);
@@ -2876,6 +3997,7 @@ fn convert_to_glb(
         &resolved,
         animation_bins,
         &node_by_name,
+        &morph_bindings,
         &mut gltf,
         &mut bin,
     )?;
@@ -2884,6 +4006,27 @@ fn convert_to_glb(
     }
     if gltf["skins"].as_array().is_some_and(Vec::is_empty) {
         gltf.as_object_mut().unwrap().remove("skins");
+    }
+    let mut extensions = used_material_extensions.into_iter().collect::<Vec<_>>();
+    if uses_texture_transform {
+        extensions.push("KHR_texture_transform".to_owned());
+    }
+    if uses_unlit {
+        extensions.push("KHR_materials_unlit".to_owned());
+    }
+    extensions.sort();
+    extensions.dedup();
+    if !extensions.is_empty() {
+        gltf["extensionsUsed"] = json!(extensions);
+    }
+    if gltf["samplers"].as_array().is_some_and(Vec::is_empty) {
+        gltf.as_object_mut().unwrap().remove("samplers");
+    }
+    if gltf["textures"].as_array().is_some_and(Vec::is_empty) {
+        gltf.as_object_mut().unwrap().remove("textures");
+    }
+    if gltf["images"].as_array().is_some_and(Vec::is_empty) {
+        gltf.as_object_mut().unwrap().remove("images");
     }
     println!("  {animation_channel_count} animation channels exported");
     gltf["buffers"]
@@ -2920,21 +4063,84 @@ fn write_glb(gltf: &Value, bin: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn test_texture_use() -> TextureUse {
+        TextureUse {
+            uid: "texture".to_owned(),
+            texcoord_unit: 3,
+            transform: TextureTransform {
+                offset: [0.0, 0.0],
+                scale: [1.0, 1.0],
+                rotation: 0.0,
+            },
+            sampler: SamplerSettings {
+                mag_filter: 9729,
+                min_filter: 9987,
+                wrap_s: 10497,
+                wrap_t: 10497,
+            },
+            alpha_channel: false,
+        }
+    }
+
+    #[test]
+    fn preserves_gltf_scene_root_coordinates() {
+        let scene = json!({
+            "osg.MatrixTransform": {
+                "Name": "GLTF_SceneRootNode",
+                "Children": []
+            }
+        });
+        assert_eq!(scene_coordinate_matrix(&scene), matrix16(None));
+    }
+
+    #[test]
+    fn converts_native_osg_coordinates() {
+        let matrix = scene_coordinate_matrix(&json!({"osg.Node": {"Children": []}}));
+        assert_eq!(
+            matrix,
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_scene_texture_bindings() {
+        assert!(contains_texture_attributes(&json!({
+            "osg.StateSet": {
+                "TextureAttributeList": [[], []]
+            }
+        })));
+        assert!(!contains_texture_attributes(
+            &json!({"osg.Node": {"Children": []}})
+        ));
+    }
+
     fn black_material() -> MaterialEntry {
         MaterialEntry {
             name: "line".to_owned(),
             base_color: [0.0, 0.0, 0.0, 1.0],
             base_color_texture: None,
             emissive_color: [0.0, 0.0, 0.0],
+            emissive_enabled: false,
             emissive_texture: None,
             occlusion_texture: None,
             normal_texture: None,
             metallic_texture: None,
             roughness_texture: None,
+            roughness_invert: false,
+            opacity_texture: None,
+            alpha_mask_texture: None,
+            alpha_invert: false,
+            normal_scale: 1.0,
+            normal_flip_y: false,
             metallic_factor: 0.0,
             roughness_factor: 1.0,
             alpha_mode: "OPAQUE",
             alpha_cutoff: 0.5,
+            double_sided: true,
+            unlit: false,
+            extensions: Map::new(),
         }
     }
 
@@ -2947,7 +4153,60 @@ mod tests {
     #[test]
     fn preserves_textured_line_materials() {
         let mut material = black_material();
-        material.base_color_texture = Some("texture".to_owned());
+        material.base_color_texture = Some(test_texture_use());
         assert!(!is_black_line_material("LineArt", Some(&material)));
+    }
+
+    #[test]
+    fn maps_sparse_source_uv_units_to_dense_gltf_units() {
+        let usage = test_texture_use();
+        let indices = HashMap::from([((usage.uid.clone(), usage.sampler), 4)]);
+        let units = HashMap::from([(3, 0)]);
+        let mut uses_transform = false;
+        let info = texture_info(&usage, &indices, &units, &mut uses_transform, true).unwrap();
+        assert_eq!(info["index"], 4);
+        assert_eq!(info["texCoord"], 0);
+        assert!(!uses_transform);
+    }
+
+    #[test]
+    fn converts_texture_transform_after_uv_flip() {
+        let mut usage = test_texture_use();
+        usage.transform.offset = [0.1, 0.2];
+        usage.transform.scale = [2.0, 3.0];
+        let mut uses_transform = false;
+        let info = texture_info_for_index(
+            0,
+            &usage,
+            &HashMap::from([(3, 0)]),
+            &mut uses_transform,
+            true,
+        );
+        assert!(uses_transform);
+        let offset = info
+            .pointer("/extensions/KHR_texture_transform/offset")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!((offset[0].as_f64().unwrap() - 0.1).abs() < 1e-6);
+        assert!((offset[1].as_f64().unwrap() + 2.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn samples_morph_tracks_linearly() {
+        let track = ScalarTrack {
+            times: vec![0.0, 2.0],
+            values: vec![0.0, 1.0],
+        };
+        assert_eq!(sample_scalar_track(&track, -1.0), 0.0);
+        assert_eq!(sample_scalar_track(&track, 1.0), 0.5);
+        assert_eq!(sample_scalar_track(&track, 3.0), 1.0);
+    }
+
+    #[test]
+    fn deduplicates_animation_times_using_last_value() {
+        let (times, values) =
+            deduplicate_keyframes(vec![0.0, 1.0, 1.0, 2.0], vec![0.0, 1.0, 2.0, 3.0], 1);
+        assert_eq!(times, vec![0.0, 1.0, 2.0]);
+        assert_eq!(values, vec![0.0, 2.0, 3.0]);
     }
 }

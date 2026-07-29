@@ -2,7 +2,7 @@
 
 Rust CLI that exports Sketchfab viewer models to self-contained glTF 2.0 (`.glb`) files.
 
-It handles model decryption, protected textures, materials, skeletons, skin weights, static poses, and animation clips.
+It handles model decryption, protected textures, PBR and shadeless materials, transparency, skeletons, skin weights, morph targets, static poses, and bone/object animation clips.
 
 ## Usage
 
