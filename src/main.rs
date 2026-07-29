@@ -1418,9 +1418,6 @@ fn process_geometry(
                         item_size,
                     );
                 }
-                for i in (1..data.len()).step_by(item_size.max(2)) {
-                    data[i] = 1.0 - data[i];
-                }
                 attributes.insert(
                     format!("_TC_{suffix}"),
                     Attribute {
